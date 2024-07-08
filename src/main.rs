@@ -1,15 +1,31 @@
+use std::fs;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Row;
 use std::fs::File;
-use std::net::TcpStream;
-use std::io::Write;
 use std::sync::{Arc};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration};
+use chrono::{Utc};
 use clap::{Parser};
-use crossbeam_channel::{bounded};
+use crossbeam_channel::{bounded, Receiver};
+use csv::Writer;
+use serde::Serialize;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+// use tokio::select;
 use tokio::time::{interval, Interval};
-use tracing::info;
+// use tokio_util::sync::CancellationToken;
+
+#[derive(Serialize)]
+struct BenchmarkRow {
+    time: String,
+
+    rate: u64,
+
+    #[serde(default = "inf")]
+    requested_rate: Option<u64>,
+}
 
 #[derive(Parser, Debug)]
 #[command()]
@@ -27,64 +43,119 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    let file_appender = tracing_appender::rolling::never("./log", "benchmark.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    tracing_subscriber::fmt().with_writer(non_blocking).init();
+    fs::create_dir_all("logs").unwrap();
+    let writer = Writer::from_path(format!("logs/benchmark_{}.log", Utc::now().to_rfc3339())).unwrap();
 
-    start_benchmark(cli.address, cli.file_path, cli.rate).await;
+    start_benchmark(cli.address, cli.file_path, cli.rate, writer).await;
 }
 
-async fn start_benchmark(address: String, file_path: String, requested_rate: Option<u64>) {
+async fn start_benchmark(address: String, file_path: String, requested_rate: Option<u64>, mut writer: Writer<File>) {
     let file = File::open(file_path).unwrap();
     let reader = SerializedFileReader::new(file).unwrap();
     let mut iter = reader.get_row_iter(None).unwrap().peekable();
 
-    let mut stream = TcpStream::connect(address).unwrap();
-
-    let number_of_tuples_sent = Arc::new(AtomicU32::new(0));
-    let start_time = Instant::now();
-
-    let mut interval: Option<Interval> = match requested_rate {
-        Some(val) => Some(interval(Duration::from_nanos(1_000_000_000 / val).into())),
-        None => None,
-    };
+    let listener = TcpListener::bind(address).await.unwrap();
 
     let done = Arc::new(AtomicBool::new(false));
     let (tx, rx) = bounded::<Row>(0);
 
-    let consumer_done = done.clone();
-    let consumer_number_of_tuples_sent = number_of_tuples_sent.clone();
-    let consumer_thread = tokio::spawn(async move {
+    let mut producer_interval: Option<Interval> = match requested_rate {
+        Some(val) => Some(interval(Duration::from_nanos(1_000_000_000 / val).into())),
+        None => None,
+    };
+
+    // let token = CancellationToken::new();
+    // let server_token = token.clone();
+    let threads = Arc::new(Mutex::new(Vec::new()));
+
+    let number_of_tuples_sent = Arc::new(AtomicU64::new(0));
+
+    let rx_server = rx.clone();
+    let done_server = done.clone();
+    let number_of_tuples_sent_server = number_of_tuples_sent.clone();
+    let threads_server = threads.clone();
+    let server_thread = tokio::spawn(async move {
         loop {
-            if rx.is_empty() && consumer_done.load(Ordering::Relaxed) {
+            // select! {
+            //     _ = server_token.cancelled() => break,
+            //     accepted = listener.accept() => {
+            //         let (stream, _) = accepted.unwrap();
+            //         let rx = rx_server.clone();
+            //         let done = done_server.clone();
+            //         let number_of_tuples_sent = number_of_tuples_sent_server.clone();
+            //         tokio::spawn(async move {
+            //             handle_connection(stream, rx, done, number_of_tuples_sent).await;
+            //         });
+            //     }
+            // }
+            let (stream, _) = listener.accept().await.unwrap();
+            let rx = rx_server.clone();
+            let done = done_server.clone();
+            let number_of_tuples_sent = number_of_tuples_sent_server.clone();
+            threads_server.lock().await.push(tokio::spawn(async move {
+                handle_connection(stream, rx, done, number_of_tuples_sent).await;
+            }));
+        }
+    });
+
+    let mut log_interval = interval(Duration::from_secs(1));
+
+    let done_log = done.clone();
+    let number_of_tuples_sent_log = number_of_tuples_sent.clone();
+    let log_thread = tokio::spawn(async move {
+        loop {
+            if done_log.load(Ordering::Relaxed) {
                 break;
             }
-            let row = rx.recv().unwrap();
-            let row_str = format!("{}\n", row.to_json_value().to_string());
-            stream.write_all(row_str.as_bytes()).unwrap();
-            consumer_number_of_tuples_sent.fetch_add(1, Ordering::Relaxed);
+            log_interval.tick().await;
+            let actual_rate = number_of_tuples_sent_log.swap(0, Ordering::AcqRel);
+
+            writer.serialize(
+                BenchmarkRow {
+                    time: Utc::now().to_rfc3339(),
+                    rate: actual_rate,
+                    requested_rate,
+                }
+            ).unwrap();
+            writer.flush().unwrap();
         }
     });
 
     loop {
         if iter.peek().is_none() {
-            done.clone().store(true, Ordering::Relaxed);
+            done.store(true, Ordering::Relaxed);
+            // token.cancel();
             break;
         }
-        if let Some(ref mut intvl) = interval {
-            intvl.tick().await;
+        if let Some(ref mut interval) = producer_interval {
+            interval.tick().await;
         }
         tx.send(iter.next().unwrap().unwrap()).unwrap();
     }
 
-    consumer_thread.await.unwrap();
+    server_thread.abort();
+    log_thread.await.unwrap();
+    for thread in threads.lock().await.iter_mut() {
+        thread.await.unwrap();
+    }
+}
 
-    let actual_rate = number_of_tuples_sent.load(Ordering::Relaxed) as f32 / start_time.elapsed().as_secs_f32();
-
-    info!("Requested rate: {} | Actual rate: {}", match requested_rate {
-        Some(rate) => rate.to_string(),
-        None => "∞".to_string(),
-    }, actual_rate);
+async fn handle_connection(mut stream: TcpStream, rx: Receiver<Row>, done: Arc<AtomicBool>, number_of_tuples_sent: Arc<AtomicU64>) {
+    loop {
+        if rx.is_empty() && done.load(Ordering::Relaxed) {
+            break;
+        }
+        let row = match rx.recv() {
+            Ok(row) => row,
+            Err(_) => break,
+        };
+        let row_str = format!("{}\n", row.to_json_value().to_string());
+        match stream.write_all(row_str.as_bytes()).await {
+            Ok(_) => (),
+            Err(_) => break,
+        };
+        number_of_tuples_sent.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // fn try_reconnect(stream: &TcpStream, address: &String) {
