@@ -13,9 +13,7 @@ use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-// use tokio::select;
 use tokio::time::{interval, Interval};
-// use tokio_util::sync::CancellationToken;
 
 #[derive(Serialize)]
 struct BenchmarkRow {
@@ -64,8 +62,6 @@ async fn start_benchmark(address: String, file_path: String, requested_rate: Opt
         None => None,
     };
 
-    // let token = CancellationToken::new();
-    // let server_token = token.clone();
     let threads = Arc::new(Mutex::new(Vec::new()));
 
     let number_of_tuples_sent = Arc::new(AtomicU64::new(0));
@@ -76,18 +72,6 @@ async fn start_benchmark(address: String, file_path: String, requested_rate: Opt
     let threads_server = threads.clone();
     let server_thread = tokio::spawn(async move {
         loop {
-            // select! {
-            //     _ = server_token.cancelled() => break,
-            //     accepted = listener.accept() => {
-            //         let (stream, _) = accepted.unwrap();
-            //         let rx = rx_server.clone();
-            //         let done = done_server.clone();
-            //         let number_of_tuples_sent = number_of_tuples_sent_server.clone();
-            //         tokio::spawn(async move {
-            //             handle_connection(stream, rx, done, number_of_tuples_sent).await;
-            //         });
-            //     }
-            // }
             let (stream, _) = listener.accept().await.unwrap();
             let rx = rx_server.clone();
             let done = done_server.clone();
@@ -124,7 +108,6 @@ async fn start_benchmark(address: String, file_path: String, requested_rate: Opt
     loop {
         if iter.peek().is_none() {
             done.store(true, Ordering::Relaxed);
-            // token.cancel();
             break;
         }
         if let Some(ref mut interval) = producer_interval {
@@ -158,12 +141,3 @@ async fn handle_connection(mut stream: TcpStream, rx: Receiver<Row>, done: Arc<A
     }
 }
 
-// fn try_reconnect(stream: &TcpStream, address: &String) {
-//     loop {
-//         let mut stream = stream.unwrap();
-//         match TcpStream::connect(address) {
-//             Ok(strm) => *stream = strm,
-//             Err(_) => continue,
-//         }
-//     }
-// }
