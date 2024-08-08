@@ -1,4 +1,6 @@
 /target
 
 benchmark*.log
+benchmark*.csv
+event*.csv
 log/
