@@ -1,0 +1,10 @@
+[package]
+name = "logger"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+chrono = "0.4.41"
+csv = "1.3.1"
