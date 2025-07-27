@@ -3,5 +3,6 @@
 benchmark*.log
 benchmark*.csv
 event*.csv
-log/
+logs/**
 *.parquet
+data/**

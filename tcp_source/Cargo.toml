@@ -1,0 +1,13 @@
+[package]
+name = "tcp_source"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+parquet = { version = "52.0.0", features = ["json"] }
+clap = { version = "4.5.7", features = ["derive"] }
+chrono = "0.4.38"
+humantime = "2.1.0"
+crossbeam-queue = "0.3.11"
+logger = { path = "../logger" }
