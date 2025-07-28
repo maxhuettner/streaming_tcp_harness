@@ -93,7 +93,7 @@ fn init_queue_from_reader(reader: SerializedFileReader<File>) -> SharedVec<Vec<u
 
     let row_data = reader
         .into_iter()
-        // .take(1000000) For testing
+        // .take(100000) // For testing
         .map(|r| {
             format!("{}\n", r.unwrap().to_json_value())
                 .as_bytes()
@@ -123,13 +123,15 @@ fn create_server_thread(
     exp_name: String,
 ) -> task::JoinHandle<()> {
     task::spawn(async move {
-        let mut repetition_id = 0;
+        let repetition_id = Arc::new(AtomicUsize::new(0));
         let num_connections = Arc::new(AtomicUsize::new(0));
         let mut row_iter = rows.iter();
 
-        let mut logger =
-            BenchmarkLoggerBuilder::new(LOG_FOLDER_PREFIX, format!("{exp_name}_{repetition_id}"))
-                .build();
+        let mut logger = BenchmarkLoggerBuilder::new(
+            LOG_FOLDER_PREFIX,
+            format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
+        )
+        .build();
         logger.start().await;
 
         while let Ok((stream, _)) = listener.accept().await {
@@ -137,11 +139,13 @@ fn create_server_thread(
                 break;
             }
 
-            if repetition_id > 0 && (num_connections.load(Ordering::Relaxed)) == 0 {
-                repetition_id += 1;
+            if (repetition_id.load(Ordering::Relaxed) > 0)
+                && (num_connections.load(Ordering::Relaxed) == 0)
+            {
+                println!("New repetition, starting logger");
                 logger = BenchmarkLoggerBuilder::new(
                     LOG_FOLDER_PREFIX,
-                    format!("{exp_name}_{repetition_id}"),
+                    format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
                 )
                 .build();
                 logger.start().await;
@@ -149,12 +153,14 @@ fn create_server_thread(
             }
 
             let writer = BufWriter::new(stream);
-            let row_iter = row_iter.clone();
 
             let logger = logger.clone();
 
+            let repetition_id = repetition_id.clone();
+            let num_connections = num_connections.clone();
+            let row_iter = row_iter.clone();
             threads.lock().await.push(task::spawn(async move {
-                handle_connection(writer, row_iter, logger).await;
+                handle_connection(writer, row_iter, logger, num_connections, repetition_id).await;
             }));
         }
     })
@@ -164,7 +170,11 @@ async fn handle_connection(
     mut writer: BufWriter<TcpStream>,
     row_iter: SharedVecIterator<Vec<u8>>,
     mut logger: BenchmarkLogger,
+    num_connections: Arc<AtomicUsize>,
+    repetition_id: Arc<AtomicUsize>,
 ) {
+    num_connections.fetch_add(1, Ordering::Relaxed);
+
     for row in row_iter {
         match writer.write_all(&row).await {
             Ok(_) => (),
@@ -174,5 +184,9 @@ async fn handle_connection(
         logger.log_event();
     }
 
-    logger.stop().await;
+    if num_connections.fetch_sub(1, Ordering::Relaxed) == 1 {
+        repetition_id.fetch_add(1, Ordering::Relaxed);
+        println!("All connections closed, stopping logger");
+        logger.stop().await;
+    }
 }
