@@ -14,6 +14,7 @@ logger = { path = "../logger" }
 serde_cbor = "0.11.2"
 prost = "0.14.1"
 prost-types = "0.14.1"
+rmp = "0.8.14"
 
 [build-dependencies]
 prost-build = "0.14.1"

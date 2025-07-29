@@ -1,4 +1,3 @@
-use prost::Message;
 mod shared_vec_iter;
 
 use crate::shared_vec_iter::{SharedVec, SharedVecIterator};
@@ -12,17 +11,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
-use prost_types::Timestamp;
+use rmp::encode::{write_array_len, write_sint, write_str};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::{io, signal, stream, task};
 
 const LOG_FOLDER_PREFIX: &str = "source";
-
-pub mod bid_event {
-    include!(concat!(env!("OUT_DIR"), "/bid_event.rs"));
-}
 
 #[derive(Parser, Debug)]
 #[command()]
@@ -106,50 +101,40 @@ fn init_queue_from_reader(reader: SerializedFileReader<File>) -> SharedVec<Vec<u
             let auction = json["auction"].as_i64().unwrap();
             let bidder  = json["bidder"].as_i64().unwrap();
             let price   = json["price"].as_i64().unwrap();
-            let channel = json["channel"].as_str().unwrap().to_string();
-            let url     = json["url"].as_str().unwrap().to_string();
-            let extra   = json["extra"].as_str().unwrap().to_string();
+            let channel = json["channel"].as_str().unwrap();
+            let url     = json["url"].as_str().unwrap();
+            let extra   = json["extra"].as_str().unwrap();
 
-            // parse timestamp (handle both RFC3339 and space‑separated)
+            // parse timestamp string to milliseconds
             let dt_str = json["dateTime"].as_str().unwrap();
             let naive_dt = if dt_str.contains('T') {
-                // e.g. "2020-01-01T12:34:56.789Z" or local
+                // RFC3339 format
                 chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%.f").unwrap()
             } else {
-                // e.g. "2020-01-01 12:34:56.789"
+                // space‐separated format
                 chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M:%S%.f").unwrap()
             };
             let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc);
-            let ts = Timestamp {
-                seconds: dt.timestamp(),
-                nanos: dt.timestamp_subsec_nanos() as i32,
-            };
+            let ms_ts = dt.timestamp() * 1000 + dt.timestamp_subsec_millis() as i64;
 
-            // build and encode Protobuf message
-            let proto = bid_event::BidEvent {
-                auction,
-                bidder,
-                price,
-                channel,
-                url,
-                date_time: Some(ts),
-                extra,
-            };
-            let mut buf = Vec::with_capacity(proto.encoded_len());
-            proto.encode(&mut buf).unwrap();
-
-            // prefix with big-endian length
-            let mut with_len = Vec::with_capacity(4 + buf.len());
-            with_len.extend(&(buf.len() as u32).to_be_bytes());
-            with_len.extend(&buf);
-            with_len
+            // write MessagePack array of 7 elements
+            let mut buf = Vec::new();
+            write_array_len(&mut buf, 7).unwrap();
+            write_sint(&mut buf, auction).unwrap();
+            write_sint(&mut buf, bidder).unwrap();
+            write_sint(&mut buf, price).unwrap();
+            write_str(&mut buf, channel).unwrap();
+            write_str(&mut buf, url).unwrap();
+            write_sint(&mut buf, ms_ts).unwrap();
+            write_str(&mut buf, extra).unwrap();
+            buf
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     let rows = SharedVec::new(row_data);
     let end_reading = Instant::now();
     println!(
-        "Reading done (took: {})",
+        "Reading & MessagePack-encoding done (took: {})",
         format_duration(Duration::from_millis(
             end_reading.duration_since(begin_reading).as_millis() as u64
         ))
