@@ -130,7 +130,11 @@ impl BenchmarkLogger {
     }
 
     pub fn log_event(&self) {
-        self.num_events.increment();
+        self.log_events(1);
+    }
+
+    pub fn log_events(&self, num_events: usize) {
+        self.num_events.increment(num_events);
         self.start_signal.notify_one();
     }
 

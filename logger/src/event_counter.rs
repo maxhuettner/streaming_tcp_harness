@@ -21,7 +21,7 @@ impl EventCounter {
         }
     }
 
-    pub fn increment(&self) {
+    pub fn increment(&self, num_events: usize) {
         let current_ts = Utc::now().timestamp_micros();
 
         self.last_elem_ts.store(current_ts, Ordering::Relaxed);
@@ -30,8 +30,8 @@ impl EventCounter {
             self.first_elem_ts.store(current_ts, Ordering::Relaxed);
         }
 
-        self.current.fetch_add(1, Ordering::Relaxed);
-        self.total.fetch_add(1, Ordering::Relaxed);
+        self.current.fetch_add(num_events, Ordering::Relaxed);
+        self.total.fetch_add(num_events, Ordering::Relaxed);
     }
 
     pub fn reset_current(&self) -> usize {
