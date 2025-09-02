@@ -5,7 +5,6 @@ use clap::Parser;
 use humantime::format_duration;
 use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use parquet::file::reader::SerializedFileReader;
-use parquet::record::Row;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use rmp::encode::{write_array_len, write_sint, write_str};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::{io, signal, stream, task};
+use tokio::{io, task};
 
 const LOG_FOLDER_PREFIX: &str = "source";
 
@@ -64,7 +63,7 @@ async fn start_benchmark(address: String, file_path: String, exp_name: String) {
         exp_name.clone(),
     );
 
-    println!("Waiting for Ctrl+C...");
+    println!("Waiting for q...");
 
     let mut lines = BufReader::new(io::stdin()).lines();
     while let Some(line) = lines.next_line().await.unwrap() {
@@ -125,8 +124,8 @@ fn init_queue_from_reader(reader: SerializedFileReader<File>) -> SharedVec<Vec<u
             write_sint(&mut buf, price).unwrap();
             write_str(&mut buf, channel).unwrap();
             write_str(&mut buf, url).unwrap();
-            write_sint(&mut buf, ms_ts).unwrap();
             write_str(&mut buf, extra).unwrap();
+            write_sint(&mut buf, ms_ts).unwrap();
             buf
         })
         .collect::<Vec<_>>();
@@ -203,10 +202,12 @@ async fn handle_connection(
     num_connections.fetch_add(1, Ordering::Relaxed);
 
     for row in row_iter {
-        match writer.write_all(&row).await {
-            Ok(_) => (),
-            Err(_) => break,
-        }
+        // let len = (row.len() as u32).to_le_bytes();
+        // let mut frame = Vec::with_capacity(4 + row.len());
+        // frame.extend_from_slice(&len);
+        // frame.extend_from_slice(&row);
+        // if writer.write_all(&frame).await.is_err() { break; }
+        if writer.write_all(&row).await.is_err() { break; }
 
         logger.log_event();
     }

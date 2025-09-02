@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 tokio = { workspace = true }
 logger = { path = "../logger" }
+clap = { workspace = true }
+humantime = "2.2.0"
+chrono = "0.4.41"
+rmp = { workspace = true }
