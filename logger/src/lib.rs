@@ -100,7 +100,7 @@ impl BenchmarkLogger {
                 log_interval.lock().await.tick().await;
 
                 let actual_rate = num_events.reset_current();
-                println!("Number of tuples sent: {actual_rate}");
+                println!("Number of tuples: {actual_rate}");
 
                 log_writer
                     .lock()
