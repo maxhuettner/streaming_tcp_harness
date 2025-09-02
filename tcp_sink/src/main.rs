@@ -1,11 +1,135 @@
-use logger::{BenchmarkLoggerBuilder};
+use clap::Parser;
+use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::{io, task};
+
+const LOG_FOLDER_PREFIX: &str = "sink";
+
+#[derive(Parser, Debug)]
+#[command()]
+struct Cli {
+    #[arg(long, short, default_value = "0.0.0.0:9000")]
+    address: String,
+
+    #[arg(long, short, default_value = "test")]
+    exp_name: String,
+}
 
 #[tokio::main]
 async fn main() {
-    println!("TCP Sink - Empty Implementation");
-    
-    // Example of using the logger
-    let mut logger = BenchmarkLoggerBuilder::new("sink","1").build();
-    
-    // TODO: Implement TCP sink functionality
+    let cli = Cli::parse();
+
+    start_benchmark(cli.address, cli.exp_name).await;
+}
+
+async fn start_benchmark(address: String, exp_name: String) {
+    let listener = TcpListener::bind(&address).await.unwrap();
+
+    let connection_threads = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let server_thread = create_server_thread(
+        listener,
+        connection_threads.clone(),
+        done.clone(),
+        exp_name.clone(),
+    );
+
+    println!("Waiting for q");
+
+    let mut lines = BufReader::new(io::stdin()).lines();
+    while let Some(line) = lines.next_line().await.unwrap() {
+        if line.trim() == "q" {
+            println!("Got 'q', shutting down…");
+            break;
+        }
+    }
+
+    done.store(true, Ordering::Relaxed);
+    join_connection_threads(connection_threads).await;
+
+    println!("Stopping server...");
+
+    TcpStream::connect(address).await.unwrap();
+    server_thread.await.unwrap();
+}
+
+async fn join_connection_threads(connection_threads: Arc<Mutex<Vec<task::JoinHandle<()>>>>) {
+    let mut threads = connection_threads.lock().await;
+    while let Some(thread) = threads.pop() {
+        thread.await.unwrap();
+    }
+}
+
+fn create_server_thread(
+    listener: TcpListener,
+    threads: Arc<Mutex<Vec<task::JoinHandle<()>>>>,
+    done: Arc<AtomicBool>,
+    exp_name: String,
+) -> task::JoinHandle<()> {
+    task::spawn(async move {
+        let repetition_id = Arc::new(AtomicUsize::new(0));
+        let num_connections = Arc::new(AtomicUsize::new(0));
+
+        let mut logger = BenchmarkLoggerBuilder::new(
+            LOG_FOLDER_PREFIX,
+            format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
+        )
+            .build();
+        logger.start().await;
+
+        while let Ok((stream, _)) = listener.accept().await {
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if (repetition_id.load(Ordering::Relaxed) > 0)
+                && (num_connections.load(Ordering::Relaxed) == 0)
+            {
+                println!("New repetition, starting logger");
+                logger = BenchmarkLoggerBuilder::new(
+                    LOG_FOLDER_PREFIX,
+                    format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
+                )
+                    .build();
+                logger.start().await;
+            }
+
+            let reader = BufReader::new(stream);
+
+            let logger = logger.clone();
+
+            let repetition_id = repetition_id.clone();
+            let num_connections = num_connections.clone();
+            threads.lock().await.push(task::spawn(async move {
+                handle_connection(reader, logger, num_connections, repetition_id).await;
+            }));
+        }
+    })
+}
+
+async fn handle_connection(
+    mut reader: BufReader<TcpStream>,
+    mut logger: BenchmarkLogger,
+    num_connections: Arc<AtomicUsize>,
+    repetition_id: Arc<AtomicUsize>,
+) {
+    num_connections.fetch_add(1, Ordering::Relaxed);
+
+    while let Ok(res) = reader.read_until(b'\n', &mut Vec::new()).await {
+        if res == 0 {
+            break;
+        }
+        logger.log_event();
+    }
+
+    if num_connections.fetch_sub(1, Ordering::Relaxed) == 1 {
+        repetition_id.fetch_add(1, Ordering::Relaxed);
+        println!("All connections closed, stopping logger");
+        logger.stop().await;
+    }
 }
