@@ -1,10 +1,11 @@
 mod shared_vec_iter;
 
 use crate::shared_vec_iter::{SharedVec, SharedVecIterator};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use humantime::format_duration;
 use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use parquet::file::reader::SerializedFileReader;
+use serde_json::Value;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,20 +33,34 @@ struct Cli {
     /// Sets the event rate in elements per second
     #[arg(long, short)]
     rate: Option<usize>,
+
+    /// Selects which schema to use for decoding
+    #[arg(long, value_enum, default_value_t = SchemaType::Bid)]
+    schema: SchemaType,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SchemaType {
+    /// Flat bid events: auction, bidder, price, channel, url, extra, dateTime
+    Bid,
+    /// Nested auction events under key `auction`
+    Auction,
+    /// Nested person events under key `person`
+    Person,
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    start_benchmark(cli.address, cli.file_path, cli.exp_name).await;
+    start_benchmark(cli.address, cli.file_path, cli.exp_name, cli.schema).await;
 }
 
-async fn start_benchmark(address: String, file_path: String, exp_name: String) {
+async fn start_benchmark(address: String, file_path: String, exp_name: String, schema: SchemaType) {
     let rows = task::spawn_blocking(move || {
         let file = File::open(file_path).unwrap();
         let reader = SerializedFileReader::new(file).unwrap();
-        init_queue_from_reader(reader)
+        init_queue_from_reader(reader, schema)
     })
     .await
     .unwrap();
@@ -89,44 +104,19 @@ async fn join_connection_threads(connection_threads: Arc<Mutex<Vec<task::JoinHan
     }
 }
 
-fn init_queue_from_reader(reader: SerializedFileReader<File>) -> SharedVec<Vec<u8>> {
+fn init_queue_from_reader(reader: SerializedFileReader<File>, schema: SchemaType) -> SharedVec<Vec<u8>> {
     let begin_reading = Instant::now();
 
     let row_data = reader
         .into_iter()
-        .map(|r| {
-            let rec = r.unwrap();
+        .filter_map(|r| {
+            let rec = r.ok()?;
             let json = rec.to_json_value();
-            let auction = json["auction"].as_i64().unwrap();
-            let bidder  = json["bidder"].as_i64().unwrap();
-            let price   = json["price"].as_i64().unwrap();
-            let channel = json["channel"].as_str().unwrap();
-            let url     = json["url"].as_str().unwrap();
-            let extra   = json["extra"].as_str().unwrap();
-
-            // parse timestamp string to milliseconds
-            let dt_str = json["dateTime"].as_str().unwrap();
-            let naive_dt = if dt_str.contains('T') {
-                // RFC3339 format
-                chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%.f").unwrap()
-            } else {
-                // space‐separated format
-                chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M:%S%.f").unwrap()
-            };
-            let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc);
-            let ms_ts = dt.timestamp() * 1000 + dt.timestamp_subsec_millis() as i64;
-
-            // write MessagePack array of 7 elements
-            let mut buf = Vec::new();
-            write_array_len(&mut buf, 7).unwrap();
-            write_sint(&mut buf, auction).unwrap();
-            write_sint(&mut buf, bidder).unwrap();
-            write_sint(&mut buf, price).unwrap();
-            write_str(&mut buf, channel).unwrap();
-            write_str(&mut buf, url).unwrap();
-            write_str(&mut buf, extra).unwrap();
-            write_sint(&mut buf, ms_ts).unwrap();
-            buf
+            match schema {
+                SchemaType::Bid => encode_bid(&json),
+                SchemaType::Auction => encode_auction(&json),
+                SchemaType::Person => encode_person(&json),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -139,6 +129,112 @@ fn init_queue_from_reader(reader: SerializedFileReader<File>) -> SharedVec<Vec<u
         ))
     );
     rows
+}
+
+fn encode_bid(json: &Value) -> Option<Vec<u8>> {
+    // Flat schema; tolerate nulls by defaulting
+    let auction = json.get("auction").and_then(Value::as_i64).unwrap_or(0);
+    let bidder = json.get("bidder").and_then(Value::as_i64).unwrap_or(0);
+    let price = json.get("price").and_then(Value::as_i64).unwrap_or(0);
+    let channel = json.get("channel").and_then(Value::as_str).unwrap_or("");
+    let url = json.get("url").and_then(Value::as_str).unwrap_or("");
+    let ms_ts = parse_dt_millis(json.get("dateTime").and_then(Value::as_str));
+    let extra = json.get("extra").and_then(Value::as_str).unwrap_or("");
+
+    // Order per spec:
+    // [auction, bidder, price, channel, url, dateTime_ms, extra]
+    let mut buf = Vec::new();
+    write_array_len(&mut buf, 7).ok()?;
+    write_sint(&mut buf, auction).ok()?;
+    write_sint(&mut buf, bidder).ok()?;
+    write_sint(&mut buf, price).ok()?;
+    write_str(&mut buf, channel).ok()?;
+    write_str(&mut buf, url).ok()?;
+    write_sint(&mut buf, ms_ts).ok()?;
+    write_str(&mut buf, extra).ok()?;
+    Some(buf)
+}
+
+fn encode_auction(json: &Value) -> Option<Vec<u8>> {
+    // Nested under key `auction` in our data files
+    let a: Option<&Value> = json.get("auction");
+    if a.is_none() || a.unwrap().is_null() { return None; }
+    let a = a.unwrap();
+
+    let id = a.get("id").and_then(Value::as_i64).unwrap_or(0);
+    let item_name = a.get("itemName").and_then(Value::as_str).unwrap_or("");
+    let description = a.get("description").and_then(Value::as_str).unwrap_or("");
+    let initial_bid = a.get("initialBid").and_then(Value::as_i64).unwrap_or(0);
+    let reserve = a.get("reserve").and_then(Value::as_i64).unwrap_or(0);
+    let dt_ms = parse_dt_millis(a.get("dateTime").and_then(Value::as_str).or_else(|| json.get("dateTime").and_then(Value::as_str)));
+    let expires_ms = parse_dt_millis(a.get("expires").and_then(Value::as_str));
+    let seller = a.get("seller").and_then(Value::as_i64).unwrap_or(0);
+    let category = a.get("category").and_then(Value::as_i64).unwrap_or(0);
+    let extra = a.get("extra").and_then(Value::as_str).unwrap_or("");
+
+    // Order per spec (10 fields):
+    // [id, itemName, description, initialBid, reserve, dateTime_ms, expires_ms, seller, category, extra]
+    let mut buf = Vec::new();
+    write_array_len(&mut buf, 10).ok()?;
+    write_sint(&mut buf, id).ok()?;
+    write_str(&mut buf, item_name).ok()?;
+    write_str(&mut buf, description).ok()?;
+    write_sint(&mut buf, initial_bid).ok()?;
+    write_sint(&mut buf, reserve).ok()?;
+    write_sint(&mut buf, dt_ms).ok()?;
+    write_sint(&mut buf, expires_ms).ok()?;
+    write_sint(&mut buf, seller).ok()?;
+    write_sint(&mut buf, category).ok()?;
+    write_str(&mut buf, extra).ok()?;
+    Some(buf)
+}
+
+fn encode_person(json: &Value) -> Option<Vec<u8>> {
+    // Nested under key `person` in our data files
+    let p = json.get("person");
+    if p.is_none() || p.unwrap().is_null() { return None; }
+    let p = p.unwrap();
+
+    // Adopt a NEXMark-like layout and tolerate missing keys
+    let id = p.get("id").and_then(Value::as_i64).unwrap_or(0);
+    let name = p.get("name").and_then(Value::as_str).unwrap_or("");
+    let email = p.get("emailAddress").and_then(Value::as_str).unwrap_or("");
+    let credit_card = p.get("creditCard").and_then(Value::as_str).unwrap_or("");
+    let city = p.get("city").and_then(Value::as_str).unwrap_or("");
+    let state = p.get("state").and_then(Value::as_str).unwrap_or("");
+    let dt_ms = parse_dt_millis(p.get("dateTime").and_then(Value::as_str).or_else(|| json.get("dateTime").and_then(Value::as_str)));
+    let extra = p.get("extra").and_then(Value::as_str).unwrap_or("");
+
+    // Order per spec (8 fields):
+    // [id, name, emailAddress, creditCard, city, state, dateTime_ms, extra]
+    let mut buf = Vec::new();
+    write_array_len(&mut buf, 8).ok()?;
+    write_sint(&mut buf, id).ok()?;
+    write_str(&mut buf, name).ok()?;
+    write_str(&mut buf, email).ok()?;
+    write_str(&mut buf, credit_card).ok()?;
+    write_str(&mut buf, city).ok()?;
+    write_str(&mut buf, state).ok()?;
+    write_sint(&mut buf, dt_ms).ok()?;
+    write_str(&mut buf, extra).ok()?;
+    Some(buf)
+}
+
+fn parse_dt_millis(dt_opt: Option<&str>) -> i64 {
+    let Some(dt_str) = dt_opt else { return 0; };
+    // parse timestamp string to milliseconds; support RFC3339 or space-separated
+    let parsed = if dt_str.contains('T') {
+        chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%.f")
+    } else {
+        chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M:%S%.f")
+    };
+    match parsed {
+        Ok(naive_dt) => {
+            let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc);
+            dt.timestamp() * 1000 + dt.timestamp_subsec_millis() as i64
+        }
+        Err(_) => 0,
+    }
 }
 
 fn create_server_thread(

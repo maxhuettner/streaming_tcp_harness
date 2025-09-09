@@ -1355,6 +1355,7 @@ dependencies = [
  "prost-types",
  "rmp",
  "serde_cbor",
+ "serde_json",
  "tokio",
 ]
 

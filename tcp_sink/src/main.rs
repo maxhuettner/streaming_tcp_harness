@@ -2,7 +2,7 @@ use clap::Parser;
 use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::{io, task};
@@ -99,7 +99,7 @@ fn create_server_thread(
                 logger.start().await;
             }
 
-            let reader = BufReader::new(stream);
+            let reader = BufReader::with_capacity(256 * 1024, stream);
 
             let logger = logger.clone();
 
@@ -120,10 +120,20 @@ async fn handle_connection(
 ) {
     num_connections.fetch_add(1, Ordering::Relaxed);
 
-    while let Ok(res) = reader.read_until(b'\n', &mut Vec::new()).await {
-        if res == 0 {
+    // Length-prefixed frames: [u32 little-endian length][payload bytes]
+    let mut len_buf = [0u8; 4];
+    loop {
+        match reader.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(_) => break,
+        }
+
+        let len = u32::from_le_bytes(len_buf) as u64;
+        let mut limited = (&mut reader).take(len);
+        if io::copy(&mut limited, &mut io::sink()).await.is_err() {
             break;
         }
+
         logger.log_event();
     }
 
