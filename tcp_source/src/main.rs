@@ -200,8 +200,8 @@ fn encode_bid(json: &Value) -> Option<Vec<u8>> {
     write_sint(&mut buf, price).ok()?;
     write_str_safe(&mut buf, channel).ok()?;
     write_str_safe(&mut buf, url).ok()?;
-    write_str_safe(&mut buf, extra).ok()?;
     write_sint(&mut buf, ms_ts).ok()?;
+    write_str_safe(&mut buf, extra).ok()?;
     Some(buf)
 }
 
