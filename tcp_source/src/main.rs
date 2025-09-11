@@ -36,6 +36,10 @@ struct Cli {
     #[arg(long, short)]
     rate: Option<usize>,
 
+    /// Limit number of events read from the parquet file
+    #[arg(long, short)]
+    num_events: Option<usize>,
+
     /// Selects which schema to use for decoding
     #[arg(long, value_enum, default_value_t = SchemaType::Bid)]
     schema: SchemaType,
@@ -43,6 +47,10 @@ struct Cli {
     /// Framing used by the source when sending rows
     #[arg(long, value_enum, default_value_t = Framing::Raw)]
     framing: Framing,
+
+    /// Enable periodic event-rate logging (writes events_*.csv). Off by default.
+    #[arg(long, default_value_t = false)]
+    event_logging: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -73,6 +81,8 @@ async fn main() {
         cli.exp_name,
         cli.schema,
         cli.rate,
+        cli.num_events,
+        cli.event_logging,
         cli.framing,
     )
     .await;
@@ -84,12 +94,14 @@ async fn start_benchmark(
     exp_name: String,
     schema: SchemaType,
     rate: Option<usize>,
+    num_events: Option<usize>,
+    event_logging: bool,
     framing: Framing,
 ) {
     let rows = task::spawn_blocking(move || {
         let file = File::open(file_path).unwrap();
         let reader = SerializedFileReader::new(file).unwrap();
-        init_queue_from_reader(reader, schema)
+        init_queue_from_reader(reader, schema, num_events)
     })
     .await
     .unwrap();
@@ -106,6 +118,7 @@ async fn start_benchmark(
         done.clone(),
         exp_name.clone(),
         rate,
+        event_logging,
         framing,
     );
 
@@ -138,21 +151,24 @@ async fn join_connection_threads(connection_threads: Arc<Mutex<Vec<task::JoinHan
 fn init_queue_from_reader(
     reader: SerializedFileReader<File>,
     schema: SchemaType,
+    num_events: Option<usize>,
 ) -> SharedVec<Vec<u8>> {
     let begin_reading = Instant::now();
 
-    let row_data = reader
-        .into_iter()
-        .filter_map(|r| {
-            let rec = r.ok()?;
-            let json = rec.to_json_value();
-            match schema {
-                SchemaType::Bid => encode_bid(&json),
-                SchemaType::Auction => encode_auction(&json),
-                SchemaType::Person => encode_person(&json),
-            }
-        })
-        .collect::<Vec<_>>();
+    let iter = reader.into_iter().filter_map(|r| {
+        let rec = r.ok()?;
+        let json = rec.to_json_value();
+        match schema {
+            SchemaType::Bid => encode_bid(&json),
+            SchemaType::Auction => encode_auction(&json),
+            SchemaType::Person => encode_person(&json),
+        }
+    });
+
+    let row_data = match num_events {
+        Some(n) => iter.take(n).collect::<Vec<_>>(),
+        None => iter.collect::<Vec<_>>(),
+    };
 
     let rows = SharedVec::new(row_data);
     let end_reading = Instant::now();
@@ -307,6 +323,41 @@ fn write_str_safe(buf: &mut Vec<u8>, s: &str) -> Result<(), rmp::encode::ValueWr
     write_str(buf, v)
 }
 
+#[inline]
+fn write_fixed_str(
+    buf: &mut Vec<u8>,
+    s: &str,
+    byte_len: usize,
+) -> Result<(), rmp::encode::ValueWriteError> {
+    let fixed = fixed_str_bytes(s, byte_len);
+    write_str(buf, &fixed)
+}
+
+// Return a UTF-8 string exactly `byte_len` bytes long by truncating
+// on a char boundary and padding with spaces as needed.
+fn fixed_str_bytes(s: &str, byte_len: usize) -> String {
+    // Handle trivial case
+    if s.len() == byte_len {
+        return s.to_string();
+    }
+    // Truncate on UTF-8 boundary if longer than desired
+    let mut out = if s.len() > byte_len {
+        let mut cut = byte_len;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s[..cut].to_string()
+    } else {
+        s.to_string()
+    };
+    // Pad with ASCII spaces up to exact byte_len
+    let cur = out.len();
+    if cur < byte_len {
+        out.push_str(&" ".repeat(byte_len - cur));
+    }
+    out
+}
+
 async fn write_frame(
     writer: &mut BufWriter<TcpStream>,
     row: &[u8],
@@ -325,6 +376,7 @@ fn create_server_thread(
     done: Arc<AtomicBool>,
     exp_name: String,
     rate: Option<usize>,
+    event_logging: bool,
     framing: Framing,
 ) -> task::JoinHandle<()> {
     task::spawn(async move {
@@ -337,7 +389,9 @@ fn create_server_thread(
             format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
         )
         .build();
-        logger.start().await;
+        if event_logging {
+            logger.start().await;
+        }
 
         while let Ok((stream, _)) = listener.accept().await {
             if done.load(Ordering::Relaxed) {
@@ -353,7 +407,9 @@ fn create_server_thread(
                     format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
                 )
                 .build();
-                logger.start().await;
+                if event_logging {
+                    logger.start().await;
+                }
                 row_iter = rows.iter();
             }
 

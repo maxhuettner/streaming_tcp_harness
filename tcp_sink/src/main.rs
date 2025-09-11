@@ -17,16 +17,20 @@ struct Cli {
 
     #[arg(long, short, default_value = "test")]
     exp_name: String,
+
+    /// Enable periodic event-rate logging (writes events_*.csv). Off by default.
+    #[arg(long, default_value_t = false)]
+    event_logging: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    start_benchmark(cli.address, cli.exp_name).await;
+    start_benchmark(cli.address, cli.exp_name, cli.event_logging).await;
 }
 
-async fn start_benchmark(address: String, exp_name: String) {
+async fn start_benchmark(address: String, exp_name: String, event_logging: bool) {
     let listener = TcpListener::bind(&address).await.unwrap();
 
     let connection_threads = Arc::new(Mutex::new(Vec::new()));
@@ -37,6 +41,7 @@ async fn start_benchmark(address: String, exp_name: String) {
         connection_threads.clone(),
         done.clone(),
         exp_name.clone(),
+        event_logging,
     );
 
     println!("Waiting for q");
@@ -70,6 +75,7 @@ fn create_server_thread(
     threads: Arc<Mutex<Vec<task::JoinHandle<()>>>>,
     done: Arc<AtomicBool>,
     exp_name: String,
+    event_logging: bool,
 ) -> task::JoinHandle<()> {
     task::spawn(async move {
         let repetition_id = Arc::new(AtomicUsize::new(0));
@@ -80,7 +86,9 @@ fn create_server_thread(
             format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
         )
         .build();
-        logger.start().await;
+        if event_logging {
+            logger.start().await;
+        }
 
         while let Ok((stream, _)) = listener.accept().await {
             if done.load(Ordering::Relaxed) {
@@ -96,7 +104,9 @@ fn create_server_thread(
                     format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
                 )
                 .build();
-                logger.start().await;
+                if event_logging {
+                    logger.start().await;
+                }
             }
 
             let reader = BufReader::with_capacity(256 * 1024, stream);
