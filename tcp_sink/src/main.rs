@@ -79,7 +79,7 @@ fn create_server_thread(
             LOG_FOLDER_PREFIX,
             format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
         )
-            .build();
+        .build();
         logger.start().await;
 
         while let Ok((stream, _)) = listener.accept().await {
@@ -95,7 +95,7 @@ fn create_server_thread(
                     LOG_FOLDER_PREFIX,
                     format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
                 )
-                    .build();
+                .build();
                 logger.start().await;
             }
 
@@ -122,12 +122,7 @@ async fn handle_connection(
 
     // Length-prefixed frames: [u32 little-endian length][payload bytes]
     let mut len_buf = [0u8; 4];
-    loop {
-        match reader.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
+    while reader.read_exact(&mut len_buf).await.is_ok() {
         let len = u32::from_le_bytes(len_buf) as u64;
         let mut limited = (&mut reader).take(len);
         if io::copy(&mut limited, &mut io::sink()).await.is_err() {
