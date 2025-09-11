@@ -12,7 +12,7 @@ use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use timerfd::{ClockId, SetTimeFlags, TimerFd as LinuxTimerFd, TimerState};
+use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -393,8 +393,8 @@ async fn handle_connection(
 
     if let Some(rate) = rate.filter(|r| *r > 0) {
         let period = std::time::Duration::from_nanos(1_000_000_000u64 / rate as u64);
-        let mut tfd = LinuxTimerFd::new_custom(ClockId::Monotonic, true, true)
-            .expect("timerfd create failed");
+        let mut tfd =
+            TimerFd::new_custom(ClockId::Monotonic, true, true).expect("timerfd create failed");
         tfd.set_state(
             TimerState::Periodic {
                 current: period,
@@ -405,30 +405,19 @@ async fn handle_connection(
         let async_tfd = AsyncFd::new(tfd).expect("asyncfd wrap failed");
 
         'outer: loop {
-            // Await readability
-            let mut guard = match async_tfd.readable().await {
-                Ok(g) => g,
-                Err(_) => break,
-            };
-            // Read number of expirations; 0 means spurious
-            let expirations = guard.get_ref().get_ref().read();
-            if expirations == 0 {
-                guard.clear_ready();
-                continue;
-            }
-            drop(guard);
+            let expirations = wait_expirations(&async_tfd).await;
 
-            let mut left = expirations;
-            while left > 0 {
-                let row = match row_iter.next() {
-                    Some(r) => r,
-                    None => break 'outer,
-                };
+            let mut sent = 0usize;
+            for row in row_iter.by_ref().take(expirations as usize) {
                 if write_frame(&mut writer, &row, framing).await.is_err() {
                     break 'outer;
                 }
                 logger.log_event();
-                left -= 1;
+                sent += 1;
+            }
+
+            if sent < expirations as usize {
+                break;
             }
         }
     } else {
@@ -444,5 +433,21 @@ async fn handle_connection(
         repetition_id.fetch_add(1, Ordering::Relaxed);
         println!("All connections closed, stopping logger");
         logger.stop().await;
+    }
+}
+
+// Read the number of timer expirations from an AsyncFd-wrapped timerfd,
+// handling spurious readiness (0 expirations) by clearing readiness and
+// awaiting again.
+async fn wait_expirations(tfd: &AsyncFd<TimerFd>) -> u64 {
+    loop {
+        let mut guard = tfd.readable().await.expect("timerfd not readable");
+        let n = guard.get_ref().get_ref().read();
+        if n == 0 {
+            // Spurious readiness; clear and wait again
+            guard.clear_ready();
+            continue;
+        }
+        return n;
     }
 }
