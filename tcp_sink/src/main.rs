@@ -9,6 +9,17 @@ use tokio::{io, task};
 
 const LOG_FOLDER_PREFIX: &str = "sink";
 
+fn delete_previous_logs(folder_prefix: &str, exp_name: &str) {
+    use std::fs;
+    use std::io::ErrorKind;
+    let folder_path = format!("logs/{folder_prefix}/{exp_name}");
+    if let Err(e) = fs::remove_dir_all(&folder_path) {
+        if e.kind() != ErrorKind::NotFound {
+            // Ignore errors; logging path cleanup is best-effort
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command()]
 struct Cli {
@@ -35,6 +46,9 @@ async fn start_benchmark(address: String, exp_name: String, event_logging: bool)
 
     let connection_threads = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
+
+    // Clean up previous logs for this experiment name on startup
+    delete_previous_logs(LOG_FOLDER_PREFIX, &exp_name);
 
     let server_thread = create_server_thread(
         listener,
@@ -82,7 +96,7 @@ fn create_server_thread(
         let num_connections = Arc::new(AtomicUsize::new(0));
 
         let mut logger = BenchmarkLoggerBuilder::new(
-            LOG_FOLDER_PREFIX,
+            format!("{LOG_FOLDER_PREFIX}/{exp_name}"),
             format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
         )
         .build();
@@ -95,12 +109,14 @@ fn create_server_thread(
                 break;
             }
 
+            println!("Accepted connection");
+
             if (repetition_id.load(Ordering::Relaxed) > 0)
                 && (num_connections.load(Ordering::Relaxed) == 0)
             {
                 println!("New repetition, starting logger");
                 logger = BenchmarkLoggerBuilder::new(
-                    LOG_FOLDER_PREFIX,
+                    format!("{LOG_FOLDER_PREFIX}/{exp_name}"),
                     format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
                 )
                 .build();
