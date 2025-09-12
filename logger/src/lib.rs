@@ -83,6 +83,8 @@ impl BenchmarkLogger {
             return;
         }
 
+        self.num_events.set_start_ts();
+
         let requested_rate = self.requested_rate;
         let log_writer = self.event_log_writer.clone();
         let num_events = self.num_events.clone();
@@ -121,6 +123,8 @@ impl BenchmarkLogger {
     }
 
     pub async fn stop(&mut self) {
+        self.num_events.set_end_ts();
+
         if let Some(log_thread) = self.log_thread.lock().await.take() {
             self.is_stop.store(true, Ordering::Relaxed);
             log_thread.await.unwrap();
@@ -141,6 +145,8 @@ impl BenchmarkLogger {
     async fn write_times(&mut self) {
         let mut writer = self.time_log_writer.lock().await;
 
+        let start_ts = self.num_events.get_start_ts();
+        let end_ts = self.num_events.get_end_ts();
         let first_elem_ts = self.num_events.get_first_elem_ts();
         let last_elem_ts = self.num_events.get_last_elem_ts();
         let duration_us = last_elem_ts - first_elem_ts;
@@ -149,15 +155,21 @@ impl BenchmarkLogger {
 
         writer
             .serialize(TimeRow {
-                start_time: DateTime::from_timestamp_micros(first_elem_ts)
+                start_time: DateTime::from_timestamp_micros(start_ts)
                     .unwrap()
                     .to_rfc3339(),
-                end_time: DateTime::from_timestamp_micros(last_elem_ts)
+                end_time: DateTime::from_timestamp_micros(end_ts)
+                    .unwrap()
+                    .to_rfc3339(),
+                first_elem_time: DateTime::from_timestamp_micros(first_elem_ts)
+                    .unwrap()
+                    .to_rfc3339(),
+                last_elem_time: DateTime::from_timestamp_micros(last_elem_ts)
                     .unwrap()
                     .to_rfc3339(),
                 duration_us,
                 num_events,
-                tps
+                tps,
             })
             .unwrap()
     }

@@ -21,6 +21,17 @@ use tokio::{io, task};
 
 const LOG_FOLDER_PREFIX: &str = "source";
 
+fn delete_previous_logs(folder_prefix: &str, exp_name: &str) {
+    use std::fs;
+    use std::io::ErrorKind;
+    let folder_path = format!("logs/{}/{}", folder_prefix, exp_name);
+    if let Err(e) = fs::remove_dir_all(&folder_path) {
+        if e.kind() != ErrorKind::NotFound {
+            // Ignore errors silently; logging not critical for runtime
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command()]
 struct Cli {
@@ -98,6 +109,9 @@ async fn start_benchmark(
     event_logging: bool,
     framing: Framing,
 ) {
+    // Clean up previous logs for this experiment name on startup
+    delete_previous_logs(LOG_FOLDER_PREFIX, &exp_name);
+
     let rows = task::spawn_blocking(move || {
         let file = File::open(file_path).unwrap();
         let reader = SerializedFileReader::new(file).unwrap();
@@ -202,6 +216,12 @@ fn encode_bid(json: &Value) -> Option<Vec<u8>> {
     write_str_safe(&mut buf, url).ok()?;
     write_sint(&mut buf, ms_ts).ok()?;
     write_str_safe(&mut buf, extra).ok()?;
+
+    // write_array_len(&mut buf, 4).ok()?;
+    // write_sint(&mut buf, auction).ok()?;
+    // write_sint(&mut buf, bidder).ok()?;
+    // write_sint(&mut buf, price).ok()?;
+    // write_sint(&mut buf, ms_ts).ok()?;
     Some(buf)
 }
 
@@ -242,6 +262,15 @@ fn encode_auction(json: &Value) -> Option<Vec<u8>> {
     write_sint(&mut buf, seller).ok()?;
     write_sint(&mut buf, category).ok()?;
     write_str_safe(&mut buf, extra).ok()?;
+
+    // write_array_len(&mut buf, 7).ok()?;
+    // write_sint(&mut buf, id).ok()?;
+    // write_sint(&mut buf, initial_bid).ok()?;
+    // write_sint(&mut buf, reserve).ok()?;
+    // write_sint(&mut buf, dt_ms).ok()?;
+    // write_sint(&mut buf, expires_ms).ok()?;
+    // write_sint(&mut buf, seller).ok()?;
+    // write_sint(&mut buf, category).ok()?;
     Some(buf)
 }
 
@@ -279,6 +308,12 @@ fn encode_person(json: &Value) -> Option<Vec<u8>> {
     write_str_safe(&mut buf, state).ok()?;
     write_sint(&mut buf, dt_ms).ok()?;
     write_str_safe(&mut buf, extra).ok()?;
+
+    // write_array_len(&mut buf, 4).ok()?;
+    // write_sint(&mut buf, id).ok()?;
+    // write_str_safe(&mut buf, credit_card).ok()?;
+    // write_sint(&mut buf, dt_ms).ok()?;
+    // write_str_safe(&mut buf, extra).ok()?;
     Some(buf)
 }
 
@@ -385,7 +420,7 @@ fn create_server_thread(
         let mut row_iter = rows.iter();
 
         let mut logger = BenchmarkLoggerBuilder::new(
-            LOG_FOLDER_PREFIX,
+            format!("{}/{}", LOG_FOLDER_PREFIX, exp_name),
             format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
         )
         .build();
@@ -398,12 +433,14 @@ fn create_server_thread(
                 break;
             }
 
+            println!("Accepted connection");
+
             if (repetition_id.load(Ordering::Relaxed) > 0)
                 && (num_connections.load(Ordering::Relaxed) == 0)
             {
                 println!("New repetition, starting logger");
                 logger = BenchmarkLoggerBuilder::new(
-                    LOG_FOLDER_PREFIX,
+                    format!("{}/{}", LOG_FOLDER_PREFIX, exp_name),
                     format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
                 )
                 .build();
