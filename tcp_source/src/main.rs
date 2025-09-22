@@ -32,6 +32,25 @@ fn delete_previous_logs(folder_prefix: &str, exp_name: &str) {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SchemaType {
+    Bid,
+    Auction,
+    Person,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum Framing {
+    None,
+    LenPrefix,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum System {
+    Default,
+    Nes,
+}
+
 #[derive(Parser, Debug)]
 #[command()]
 struct Cli {
@@ -42,6 +61,9 @@ struct Cli {
 
     #[arg(long, short, default_value = "test")]
     exp_name: String,
+
+    #[arg(long, short, value_enum, default_value_t = System::Default)]
+    system: System,
 
     /// Sets the event rate in elements per second
     #[arg(long, short)]
@@ -56,30 +78,12 @@ struct Cli {
     schema: SchemaType,
 
     /// Framing used by the source when sending rows
-    #[arg(long, value_enum, default_value_t = Framing::Raw)]
+    #[arg(long, value_enum, default_value_t = Framing::None)]
     framing: Framing,
 
     /// Enable periodic event-rate logging (writes events_*.csv). Off by default.
     #[arg(long, default_value_t = false)]
     event_logging: bool,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum SchemaType {
-    /// Flat bid events: auction, bidder, price, channel, url, extra, dateTime
-    Bid,
-    /// Nested auction events under key `auction`
-    Auction,
-    /// Nested person events under key `person`
-    Person,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum Framing {
-    /// Write raw MessagePack without a length prefix
-    Raw,
-    /// Write 4-byte little-endian length followed by payload
-    Len,
 }
 
 #[tokio::main]
@@ -90,6 +94,7 @@ async fn main() {
         cli.address,
         cli.file_path,
         cli.exp_name,
+        cli.system,
         cli.schema,
         cli.rate,
         cli.num_events,
@@ -103,6 +108,7 @@ async fn start_benchmark(
     address: String,
     file_path: String,
     exp_name: String,
+    system: System,
     schema: SchemaType,
     rate: Option<usize>,
     num_events: Option<usize>,
@@ -115,7 +121,7 @@ async fn start_benchmark(
     let rows = task::spawn_blocking(move || {
         let file = File::open(file_path).unwrap();
         let reader = SerializedFileReader::new(file).unwrap();
-        init_queue_from_reader(reader, schema, num_events)
+        init_queue_from_reader(reader, schema, system, num_events)
     })
     .await
     .unwrap();
@@ -131,6 +137,7 @@ async fn start_benchmark(
         connection_threads.clone(),
         done.clone(),
         exp_name.clone(),
+        system.clone(),
         rate,
         event_logging,
         framing,
@@ -165,6 +172,7 @@ async fn join_connection_threads(connection_threads: Arc<Mutex<Vec<task::JoinHan
 fn init_queue_from_reader(
     reader: SerializedFileReader<File>,
     schema: SchemaType,
+    system: System,
     num_events: Option<usize>,
 ) -> SharedVec<Vec<u8>> {
     let begin_reading = Instant::now();
@@ -173,9 +181,9 @@ fn init_queue_from_reader(
         let rec = r.ok()?;
         let json = rec.to_json_value();
         match schema {
-            SchemaType::Bid => encode_bid(&json),
-            SchemaType::Auction => encode_auction(&json),
-            SchemaType::Person => encode_person(&json),
+            SchemaType::Bid => encode_bid(&json, &system),
+            SchemaType::Auction => encode_auction(&json, &system),
+            SchemaType::Person => encode_person(&json, &system),
         }
     });
 
@@ -195,7 +203,7 @@ fn init_queue_from_reader(
     rows
 }
 
-fn encode_bid(json: &Value) -> Option<Vec<u8>> {
+fn encode_bid(json: &Value, system: &System) -> Option<Vec<u8>> {
     // Flat schema; tolerate nulls by defaulting
     let auction = json.get("auction").and_then(Value::as_i64).unwrap_or(0);
     let bidder = json.get("bidder").and_then(Value::as_i64).unwrap_or(0);
@@ -208,24 +216,31 @@ fn encode_bid(json: &Value) -> Option<Vec<u8>> {
     // Order per legacy spec (matches master and downstream parsers):
     // [auction, bidder, price, channel, url, extra, dateTime_ms]
     let mut buf = Vec::new();
-    write_array_len(&mut buf, 7).ok()?;
-    write_sint(&mut buf, auction).ok()?;
-    write_sint(&mut buf, bidder).ok()?;
-    write_sint(&mut buf, price).ok()?;
-    write_str_safe(&mut buf, channel).ok()?;
-    write_str_safe(&mut buf, url).ok()?;
-    write_sint(&mut buf, ms_ts).ok()?;
-    write_str_safe(&mut buf, extra).ok()?;
 
-    // write_array_len(&mut buf, 4).ok()?;
-    // write_sint(&mut buf, auction).ok()?;
-    // write_sint(&mut buf, bidder).ok()?;
-    // write_sint(&mut buf, price).ok()?;
-    // write_sint(&mut buf, ms_ts).ok()?;
+    match system {
+        System::Default => {
+            write_array_len(&mut buf, 7).ok()?;
+            write_sint(&mut buf, auction).ok()?;
+            write_sint(&mut buf, bidder).ok()?;
+            write_sint(&mut buf, price).ok()?;
+            write_str_safe(&mut buf, channel).ok()?;
+            write_str_safe(&mut buf, url).ok()?;
+            write_sint(&mut buf, ms_ts).ok()?;
+            write_str_safe(&mut buf, extra).ok()?;
+        }
+        System::Nes => {
+            write_array_len(&mut buf, 4).ok()?;
+            write_sint(&mut buf, auction).ok()?;
+            write_sint(&mut buf, bidder).ok()?;
+            write_sint(&mut buf, price).ok()?;
+            write_sint(&mut buf, ms_ts).ok()?;
+        }
+    }
+
     Some(buf)
 }
 
-fn encode_auction(json: &Value) -> Option<Vec<u8>> {
+fn encode_auction(json: &Value, system: &System) -> Option<Vec<u8>> {
     // Nested under key `auction` in our data files
     let a: Option<&Value> = json.get("auction");
     if a.is_none() || a.unwrap().is_null() {
@@ -251,30 +266,37 @@ fn encode_auction(json: &Value) -> Option<Vec<u8>> {
     // Order per spec (10 fields):
     // [id, itemName, description, initialBid, reserve, dateTime_ms, expires_ms, seller, category, extra]
     let mut buf = Vec::new();
-    write_array_len(&mut buf, 10).ok()?;
-    write_sint(&mut buf, id).ok()?;
-    write_str_safe(&mut buf, item_name).ok()?;
-    write_str_safe(&mut buf, description).ok()?;
-    write_sint(&mut buf, initial_bid).ok()?;
-    write_sint(&mut buf, reserve).ok()?;
-    write_sint(&mut buf, dt_ms).ok()?;
-    write_sint(&mut buf, expires_ms).ok()?;
-    write_sint(&mut buf, seller).ok()?;
-    write_sint(&mut buf, category).ok()?;
-    write_str_safe(&mut buf, extra).ok()?;
 
-    // write_array_len(&mut buf, 7).ok()?;
-    // write_sint(&mut buf, id).ok()?;
-    // write_sint(&mut buf, initial_bid).ok()?;
-    // write_sint(&mut buf, reserve).ok()?;
-    // write_sint(&mut buf, dt_ms).ok()?;
-    // write_sint(&mut buf, expires_ms).ok()?;
-    // write_sint(&mut buf, seller).ok()?;
-    // write_sint(&mut buf, category).ok()?;
+    match system {
+        System::Default => {
+            write_array_len(&mut buf, 10).ok()?;
+            write_sint(&mut buf, id).ok()?;
+            write_str_safe(&mut buf, item_name).ok()?;
+            write_str_safe(&mut buf, description).ok()?;
+            write_sint(&mut buf, initial_bid).ok()?;
+            write_sint(&mut buf, reserve).ok()?;
+            write_sint(&mut buf, dt_ms).ok()?;
+            write_sint(&mut buf, expires_ms).ok()?;
+            write_sint(&mut buf, seller).ok()?;
+            write_sint(&mut buf, category).ok()?;
+            write_str_safe(&mut buf, extra).ok()?;
+        }
+        System::Nes => {
+            write_array_len(&mut buf, 7).ok()?;
+            write_sint(&mut buf, id).ok()?;
+            write_sint(&mut buf, initial_bid).ok()?;
+            write_sint(&mut buf, reserve).ok()?;
+            write_sint(&mut buf, dt_ms).ok()?;
+            write_sint(&mut buf, expires_ms).ok()?;
+            write_sint(&mut buf, seller).ok()?;
+            write_sint(&mut buf, category).ok()?;
+        }
+    }
+
     Some(buf)
 }
 
-fn encode_person(json: &Value) -> Option<Vec<u8>> {
+fn encode_person(json: &Value, system: &System) -> Option<Vec<u8>> {
     // Nested under key `person` in our data files
     let p = json.get("person");
     if p.is_none() || p.unwrap().is_null() {
@@ -299,21 +321,28 @@ fn encode_person(json: &Value) -> Option<Vec<u8>> {
     // Order per spec (8 fields):
     // [id, name, emailAddress, creditCard, city, state, dateTime_ms, extra]
     let mut buf = Vec::new();
-    write_array_len(&mut buf, 8).ok()?;
-    write_sint(&mut buf, id).ok()?;
-    write_str_safe(&mut buf, name).ok()?;
-    write_str_safe(&mut buf, email).ok()?;
-    write_str_safe(&mut buf, credit_card).ok()?;
-    write_str_safe(&mut buf, city).ok()?;
-    write_str_safe(&mut buf, state).ok()?;
-    write_sint(&mut buf, dt_ms).ok()?;
-    write_str_safe(&mut buf, extra).ok()?;
 
-    // write_array_len(&mut buf, 4).ok()?;
-    // write_sint(&mut buf, id).ok()?;
-    // write_str_safe(&mut buf, credit_card).ok()?;
-    // write_sint(&mut buf, dt_ms).ok()?;
-    // write_str_safe(&mut buf, extra).ok()?;
+    match system {
+        System::Default => {
+            write_array_len(&mut buf, 8).ok()?;
+            write_sint(&mut buf, id).ok()?;
+            write_str_safe(&mut buf, name).ok()?;
+            write_str_safe(&mut buf, email).ok()?;
+            write_str_safe(&mut buf, credit_card).ok()?;
+            write_str_safe(&mut buf, city).ok()?;
+            write_str_safe(&mut buf, state).ok()?;
+            write_sint(&mut buf, dt_ms).ok()?;
+            write_str_safe(&mut buf, extra).ok()?;
+        }
+        System::Nes => {
+            write_array_len(&mut buf, 4).ok()?;
+            write_sint(&mut buf, id).ok()?;
+            write_str_safe(&mut buf, credit_card).ok()?;
+            write_sint(&mut buf, dt_ms).ok()?;
+            write_str_safe(&mut buf, extra).ok()?;
+        }
+    }
+
     Some(buf)
 }
 
@@ -398,7 +427,7 @@ async fn write_frame(
     row: &[u8],
     framing: Framing,
 ) -> io::Result<()> {
-    if matches!(framing, Framing::Len) {
+    if matches!(framing, Framing::LenPrefix) {
         writer.write_all(&(row.len() as u32).to_le_bytes()).await?;
     }
     writer.write_all(row).await
@@ -410,6 +439,7 @@ fn create_server_thread(
     threads: Arc<Mutex<Vec<task::JoinHandle<()>>>>,
     done: Arc<AtomicBool>,
     exp_name: String,
+    system: System,
     rate: Option<usize>,
     event_logging: bool,
     framing: Framing,
