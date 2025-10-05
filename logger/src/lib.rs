@@ -151,7 +151,11 @@ impl BenchmarkLogger {
         let last_elem_ts = self.num_events.get_last_elem_ts();
         let duration_us = last_elem_ts - first_elem_ts;
         let num_events = self.num_events.get_total();
-        let tps = ((num_events as f64) / (duration_us as f64) * 1_000_000.0) as usize;
+        let tps = if num_events == 0 || duration_us <= 0 {
+            0
+        } else {
+            ((num_events as f64) / (duration_us as f64) * 1_000_000.0) as usize
+        };
 
         writer
             .serialize(TimeRow {

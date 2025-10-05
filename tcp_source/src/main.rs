@@ -9,6 +9,7 @@ use parquet::file::reader::SerializedFileReader;
 use rmp::encode::{write_array_len, write_sint, write_str};
 use serde_json::Value;
 use std::fs::File;
+use std::io::{BufRead, BufReader as StdBufReader};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,6 +52,12 @@ enum System {
     Nes,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum InputFormat {
+    Parquet,
+    Csv,
+}
+
 #[derive(Parser, Debug)]
 #[command()]
 struct Cli {
@@ -65,15 +72,19 @@ struct Cli {
     #[arg(long, short, value_enum, default_value_t = System::Default)]
     system: System,
 
+    /// Selects how to read input data from `file_path`
+    #[arg(long, value_enum, default_value_t = InputFormat::Parquet)]
+    input_format: InputFormat,
+
     /// Sets the event rate in elements per second
     #[arg(long, short)]
     rate: Option<usize>,
 
-    /// Limit number of events read from the parquet file
+    /// Limit number of events read from the input file
     #[arg(long, short)]
     num_events: Option<usize>,
 
-    /// Selects which schema to use for decoding
+    /// Selects which schema to use for decoding (parquet input only)
     #[arg(long, value_enum, default_value_t = SchemaType::Bid)]
     schema: SchemaType,
 
@@ -95,6 +106,7 @@ async fn main() {
         cli.file_path,
         cli.exp_name,
         cli.system,
+        cli.input_format,
         cli.schema,
         cli.rate,
         cli.num_events,
@@ -109,6 +121,7 @@ async fn start_benchmark(
     file_path: String,
     exp_name: String,
     system: System,
+    input_format: InputFormat,
     schema: SchemaType,
     rate: Option<usize>,
     num_events: Option<usize>,
@@ -118,10 +131,13 @@ async fn start_benchmark(
     // Clean up previous logs for this experiment name on startup
     delete_previous_logs(LOG_FOLDER_PREFIX, &exp_name);
 
-    let rows = task::spawn_blocking(move || {
-        let file = File::open(file_path).unwrap();
-        let reader = SerializedFileReader::new(file).unwrap();
-        init_queue_from_reader(reader, schema, system, num_events)
+    let rows = task::spawn_blocking(move || match input_format {
+        InputFormat::Parquet => {
+            let file = File::open(&file_path).unwrap();
+            let reader = SerializedFileReader::new(file).unwrap();
+            init_queue_from_reader(reader, schema, system, num_events)
+        }
+        InputFormat::Csv => init_queue_from_csv(&file_path, num_events),
     })
     .await
     .unwrap();
@@ -203,6 +219,32 @@ fn init_queue_from_reader(
     rows
 }
 
+fn init_queue_from_csv(file_path: &str, num_events: Option<usize>) -> SharedVec<Vec<u8>> {
+    let begin_reading = Instant::now();
+    let file = File::open(file_path).unwrap();
+    let reader = StdBufReader::new(file);
+
+    let lines = reader.lines().filter_map(|line| match line {
+        Ok(content) => encode_csv_line(&content),
+        Err(_) => None,
+    });
+
+    let row_data = match num_events {
+        Some(n) => lines.take(n).collect::<Vec<_>>(),
+        None => lines.collect::<Vec<_>>(),
+    };
+
+    let rows = SharedVec::new(row_data);
+    let end_reading = Instant::now();
+    println!(
+        "Reading & MessagePack-encoding done (took: {})",
+        format_duration(Duration::from_millis(
+            end_reading.duration_since(begin_reading).as_millis() as u64
+        ))
+    );
+    rows
+}
+
 fn encode_bid(json: &Value, system: &System) -> Option<Vec<u8>> {
     // Flat schema; tolerate nulls by defaulting
     let auction = json.get("auction").and_then(Value::as_i64).unwrap_or(0);
@@ -237,6 +279,13 @@ fn encode_bid(json: &Value, system: &System) -> Option<Vec<u8>> {
         }
     }
 
+    Some(buf)
+}
+
+fn encode_csv_line(line: &str) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_array_len(&mut buf, 1).ok()?;
+    write_str(&mut buf, line).ok()?;
     Some(buf)
 }
 
