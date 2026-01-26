@@ -6,13 +6,13 @@ use clap::{Parser, ValueEnum};
 use humantime::format_duration;
 use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use parquet::file::reader::SerializedFileReader;
-use rmp::encode::{write_array_len, write_sint, write_str};
+use rmp::encode::{write_array_len, write_sint, write_str, write_uint};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader as StdBufReader};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -95,6 +95,10 @@ struct Cli {
     /// Enable periodic event-rate logging (writes events_*.csv). Off by default.
     #[arg(long, default_value_t = false)]
     event_logging: bool,
+
+    /// Append a high-resolution send timestamp (ns since Unix epoch) as an extra array field.
+    #[arg(long, default_value_t = false)]
+    latency: bool,
 }
 
 #[tokio::main]
@@ -112,6 +116,7 @@ async fn main() {
         cli.num_events,
         cli.event_logging,
         cli.framing,
+        cli.latency,
     )
     .await;
 }
@@ -127,6 +132,7 @@ async fn start_benchmark(
     num_events: Option<usize>,
     event_logging: bool,
     framing: Framing,
+    latency: bool,
 ) {
     // Clean up previous logs for this experiment name on startup
     delete_previous_logs(LOG_FOLDER_PREFIX, &exp_name);
@@ -157,6 +163,7 @@ async fn start_benchmark(
         rate,
         event_logging,
         framing,
+        latency,
     );
 
     println!("Waiting for q...");
@@ -471,15 +478,67 @@ fn fixed_str_bytes(s: &str, byte_len: usize) -> String {
     out
 }
 
+fn parse_array_header(row: &[u8]) -> Option<(u32, usize)> {
+    let first = *row.first()?;
+    match first {
+        0x90..=0x9f => Some(((first & 0x0f) as u32, 1)),
+        0xdc => {
+            if row.len() < 3 {
+                return None;
+            }
+            let len = u16::from_be_bytes([row[1], row[2]]) as u32;
+            Some((len, 3))
+        }
+        0xdd => {
+            if row.len() < 5 {
+                return None;
+            }
+            let len = u32::from_be_bytes([row[1], row[2], row[3], row[4]]);
+            Some((len, 5))
+        }
+        _ => None,
+    }
+}
+
+fn with_latency_field(row: &[u8], ts_ns: u64) -> io::Result<Vec<u8>> {
+    let (len, header_len) = parse_array_header(row).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "row is not a msgpack array")
+    })?;
+    let new_len = len
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "array length overflow"))?;
+
+    let mut out = Vec::with_capacity(row.len() + 10);
+    write_array_len(&mut out, new_len)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    out.extend_from_slice(&row[header_len..]);
+    write_uint(&mut out, ts_ns)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(out)
+}
+
 async fn write_frame(
     writer: &mut BufWriter<TcpStream>,
     row: &[u8],
     framing: Framing,
+    latency: bool,
 ) -> io::Result<()> {
+    let row_with_latency = if latency {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        Some(with_latency_field(row, now.as_nanos() as u64)?)
+    } else {
+        None
+    };
+    let row_bytes = row_with_latency.as_deref().unwrap_or(row);
+
     if matches!(framing, Framing::LenPrefix) {
-        writer.write_all(&(row.len() as u32).to_le_bytes()).await?;
+        writer
+            .write_all(&(row_bytes.len() as u32).to_le_bytes())
+            .await?;
     }
-    writer.write_all(row).await
+    writer.write_all(row_bytes).await
 }
 
 fn create_server_thread(
@@ -492,6 +551,7 @@ fn create_server_thread(
     rate: Option<usize>,
     event_logging: bool,
     framing: Framing,
+    latency: bool,
 ) -> task::JoinHandle<()> {
     task::spawn(async move {
         let repetition_id = Arc::new(AtomicUsize::new(0));
@@ -517,7 +577,7 @@ fn create_server_thread(
             if (repetition_id.load(Ordering::Relaxed) > 0)
                 && (num_connections.load(Ordering::Relaxed) == 0)
             {
-                println!("New repetition, starting logger");
+                println!("Repetition {}, starting logger", repetition_id.load(Ordering::Relaxed));
                 logger = BenchmarkLoggerBuilder::new(
                     format!("{}/{}", LOG_FOLDER_PREFIX, exp_name),
                     format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
@@ -545,6 +605,7 @@ fn create_server_thread(
                     repetition_id,
                     rate,
                     framing,
+                    latency,
                 )
                 .await;
             }));
@@ -560,6 +621,7 @@ async fn handle_connection(
     repetition_id: Arc<AtomicUsize>,
     rate: Option<usize>,
     framing: Framing,
+    latency: bool,
 ) {
     num_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -581,7 +643,10 @@ async fn handle_connection(
 
             let mut sent = 0usize;
             for row in row_iter.by_ref().take(expirations as usize) {
-                if write_frame(&mut writer, &row, framing).await.is_err() {
+                if write_frame(&mut writer, &row, framing, latency)
+                    .await
+                    .is_err()
+                {
                     break 'outer;
                 }
                 logger.log_event();
@@ -594,7 +659,10 @@ async fn handle_connection(
         }
     } else {
         for row in row_iter {
-            if write_frame(&mut writer, &row, framing).await.is_err() {
+            if write_frame(&mut writer, &row, framing, latency)
+                .await
+                .is_err()
+            {
                 break;
             }
             logger.log_event();
