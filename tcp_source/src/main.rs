@@ -6,7 +6,7 @@ use clap::{Parser, ValueEnum};
 use humantime::format_duration;
 use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use parquet::file::reader::SerializedFileReader;
-use rmp::encode::{write_array_len, write_sint, write_str, write_uint};
+use rmp::encode::{write_array_len, write_nil, write_sint, write_str, write_uint};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader as StdBufReader};
@@ -99,7 +99,50 @@ struct Cli {
     /// Append a high-resolution send timestamp (ns since Unix epoch) as an extra array field.
     #[arg(long, default_value_t = false)]
     latency: bool,
+
+    /// Percentage (0-100) of Bid `price` values to encode as null (MessagePack nil).
+    #[arg(long)]
+    null_price_percent: Option<u8>,
 }
+
+/* -------------------- Simple PRNG + helper -------------------- */
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(mut seed: u64) -> Self {
+        if seed == 0 {
+            seed = 0x9E37_79B9_7F4A_7C15; // avoid zero-lock
+        }
+        Self { state: seed }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        // xorshift64*
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        ((x.wrapping_mul(0x2545_F491_4F6C_DD1D)) >> 32) as u32
+    }
+}
+
+#[inline]
+fn should_null_price(pct: Option<u8>, rng: &mut XorShift64) -> bool {
+    let p = pct.unwrap_or(0).min(100);
+    if p == 0 {
+        return false;
+    }
+    if p == 100 {
+        return true;
+    }
+    (rng.next_u32() % 100) < p as u32
+}
+
+/* -------------------- Main -------------------- */
 
 #[tokio::main]
 async fn main() {
@@ -117,6 +160,7 @@ async fn main() {
         cli.event_logging,
         cli.framing,
         cli.latency,
+        cli.null_price_percent,
     )
     .await;
 }
@@ -133,6 +177,7 @@ async fn start_benchmark(
     event_logging: bool,
     framing: Framing,
     latency: bool,
+    null_price_percent: Option<u8>,
 ) {
     // Clean up previous logs for this experiment name on startup
     delete_previous_logs(LOG_FOLDER_PREFIX, &exp_name);
@@ -141,7 +186,7 @@ async fn start_benchmark(
         InputFormat::Parquet => {
             let file = File::open(&file_path).unwrap();
             let reader = SerializedFileReader::new(file).unwrap();
-            init_queue_from_reader(reader, schema, system, num_events)
+            init_queue_from_reader(reader, schema, system, num_events, null_price_percent)
         }
         InputFormat::Csv => init_queue_from_csv(&file_path, num_events),
     })
@@ -197,14 +242,25 @@ fn init_queue_from_reader(
     schema: SchemaType,
     system: System,
     num_events: Option<usize>,
+    null_price_percent: Option<u8>,
 ) -> SharedVec<Vec<u8>> {
     let begin_reading = Instant::now();
 
-    let iter = reader.into_iter().filter_map(|r| {
+    // Seed PRNG once per file load (stable-ish per run, not per row).
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(1))
+        .as_nanos() as u64;
+    let mut rng = XorShift64::new(seed);
+
+    let iter = reader.into_iter().filter_map(move |r| {
         let rec = r.ok()?;
         let json = rec.to_json_value();
         match schema {
-            SchemaType::Bid => encode_bid(&json, &system),
+            SchemaType::Bid => {
+                let null_price = should_null_price(null_price_percent, &mut rng);
+                encode_bid(&json, &system, null_price)
+            }
             SchemaType::Auction => encode_auction(&json, &system),
             SchemaType::Person => encode_person(&json, &system),
         }
@@ -252,7 +308,7 @@ fn init_queue_from_csv(file_path: &str, num_events: Option<usize>) -> SharedVec<
     rows
 }
 
-fn encode_bid(json: &Value, system: &System) -> Option<Vec<u8>> {
+fn encode_bid(json: &Value, system: &System, null_price: bool) -> Option<Vec<u8>> {
     // Flat schema; tolerate nulls by defaulting
     let auction = json.get("auction").and_then(Value::as_i64).unwrap_or(0);
     let bidder = json.get("bidder").and_then(Value::as_i64).unwrap_or(0);
@@ -271,7 +327,13 @@ fn encode_bid(json: &Value, system: &System) -> Option<Vec<u8>> {
             write_array_len(&mut buf, 7).ok()?;
             write_sint(&mut buf, auction).ok()?;
             write_sint(&mut buf, bidder).ok()?;
-            write_sint(&mut buf, price).ok()?;
+
+            if null_price {
+                write_nil(&mut buf).ok()?;
+            } else {
+                write_sint(&mut buf, price).ok()?;
+            }
+
             write_str_safe(&mut buf, channel).ok()?;
             write_str_safe(&mut buf, url).ok()?;
             write_sint(&mut buf, ms_ts).ok()?;
@@ -281,7 +343,13 @@ fn encode_bid(json: &Value, system: &System) -> Option<Vec<u8>> {
             write_array_len(&mut buf, 4).ok()?;
             write_sint(&mut buf, auction).ok()?;
             write_sint(&mut buf, bidder).ok()?;
-            write_sint(&mut buf, price).ok()?;
+
+            if null_price {
+                write_nil(&mut buf).ok()?;
+            } else {
+                write_sint(&mut buf, price).ok()?;
+            }
+
             write_sint(&mut buf, ms_ts).ok()?;
         }
     }
