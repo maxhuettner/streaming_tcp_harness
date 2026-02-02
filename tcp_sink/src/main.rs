@@ -9,9 +9,6 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::{io, task};
-use rmp::decode::{read_array_len, read_marker, RmpRead, ValueReadError};
-use rmp::Marker;
-use std::io::Cursor;
 
 const LOG_FOLDER_PREFIX: &str = "sink";
 
@@ -182,12 +179,12 @@ async fn handle_connection(
 ) {
     num_connections.fetch_add(1, Ordering::Relaxed);
 
-    // Length-prefixed frames: [u32 little-endian length][payload bytes]
+    // Length-prefixed frames: [i32 big-endian length][payload bytes]
     let mut len_buf = [0u8; 4];
     let mut payload = Vec::new();
     let mut stats = LatencyStats::default();
     while reader.read_exact(&mut len_buf).await.is_ok() {
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let len = i32::from_be_bytes(len_buf) as usize;
         if latency {
             payload.resize(len, 0);
             if reader.read_exact(&mut payload).await.is_err() {
@@ -268,209 +265,28 @@ impl LatencyStats {
 }
 
 fn extract_send_ts_ns(buf: &[u8]) -> io::Result<Option<i64>> {
-    let mut cur = Cursor::new(buf);
-    let len = read_array_len(&mut cur).map_err(to_io_err)?;
-    if len == 0 {
+    // Wire format: [nullBitmap[N]][field values]
+    // The last field should be an int64 timestamp
+    // Read the last 8 bytes of the buffer as the timestamp
+    if buf.len() < 8 {
         return Ok(None);
     }
-    for _ in 0..(len - 1) {
-        skip_value(&mut cur).map_err(to_io_err)?;
-    }
-    let marker = read_marker(&mut cur).map_err(to_io_err)?;
-    let ts = match marker {
-        Marker::FixPos(val) => val as i64,
-        Marker::FixNeg(val) => val as i64,
-        Marker::U8 => cur.read_data_u8().map_err(to_io_err)? as i64,
-        Marker::U16 => cur.read_data_u16().map_err(to_io_err)? as i64,
-        Marker::U32 => cur.read_data_u32().map_err(to_io_err)? as i64,
-        Marker::U64 => {
-            let v = cur.read_data_u64().map_err(to_io_err)?;
-            v.min(i64::MAX as u64) as i64
-        }
-        Marker::I8 => cur.read_data_i8().map_err(to_io_err)? as i64,
-        Marker::I16 => cur.read_data_i16().map_err(to_io_err)? as i64,
-        Marker::I32 => cur.read_data_i32().map_err(to_io_err)? as i64,
-        Marker::I64 => cur.read_data_i64().map_err(to_io_err)?,
-        _ => {
-            skip_value_with_marker(&mut cur, marker).map_err(to_io_err)?;
-            return Ok(None);
-        }
-    };
+
+    let ts_bytes = &buf[buf.len() - 8..];
+    let ts = i64::from_be_bytes([
+        ts_bytes[0],
+        ts_bytes[1],
+        ts_bytes[2],
+        ts_bytes[3],
+        ts_bytes[4],
+        ts_bytes[5],
+        ts_bytes[6],
+        ts_bytes[7],
+    ]);
+
     Ok(Some(ts))
 }
 
-fn to_io_err<E: std::fmt::Debug>(err: E) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-}
-
-fn skip_value<R: RmpRead>(rd: &mut R) -> Result<(), ValueReadError<R::Error>> {
-    let marker = read_marker(rd)?;
-    skip_value_with_marker(rd, marker)
-}
-
-fn skip_value_with_marker<R: RmpRead>(
-    rd: &mut R,
-    marker: Marker,
-) -> Result<(), ValueReadError<R::Error>> {
-    match marker {
-        Marker::FixPos(_) | Marker::FixNeg(_) | Marker::Null | Marker::True | Marker::False => Ok(()),
-        Marker::U8 => {
-            rd.read_data_u8()?;
-            Ok(())
-        }
-        Marker::U16 => {
-            rd.read_data_u16()?;
-            Ok(())
-        }
-        Marker::U32 => {
-            rd.read_data_u32()?;
-            Ok(())
-        }
-        Marker::U64 => {
-            rd.read_data_u64()?;
-            Ok(())
-        }
-        Marker::I8 => {
-            rd.read_data_i8()?;
-            Ok(())
-        }
-        Marker::I16 => {
-            rd.read_data_i16()?;
-            Ok(())
-        }
-        Marker::I32 => {
-            rd.read_data_i32()?;
-            Ok(())
-        }
-        Marker::I64 => {
-            rd.read_data_i64()?;
-            Ok(())
-        }
-        Marker::F32 => {
-            rd.read_data_f32()?;
-            Ok(())
-        }
-        Marker::F64 => {
-            rd.read_data_f64()?;
-            Ok(())
-        }
-        Marker::FixStr(len) => skip_bytes(rd, len as usize),
-        Marker::Str8 => {
-            let len = rd.read_data_u8()? as usize;
-            skip_bytes(rd, len)
-        }
-        Marker::Str16 => {
-            let len = rd.read_data_u16()? as usize;
-            skip_bytes(rd, len)
-        }
-        Marker::Str32 => {
-            let len = rd.read_data_u32()? as usize;
-            skip_bytes(rd, len)
-        }
-        Marker::Bin8 => {
-            let len = rd.read_data_u8()? as usize;
-            skip_bytes(rd, len)
-        }
-        Marker::Bin16 => {
-            let len = rd.read_data_u16()? as usize;
-            skip_bytes(rd, len)
-        }
-        Marker::Bin32 => {
-            let len = rd.read_data_u32()? as usize;
-            skip_bytes(rd, len)
-        }
-        Marker::FixArray(len) => {
-            for _ in 0..len {
-                skip_value(rd)?;
-            }
-            Ok(())
-        }
-        Marker::Array16 => {
-            let len = rd.read_data_u16()?;
-            for _ in 0..len {
-                skip_value(rd)?;
-            }
-            Ok(())
-        }
-        Marker::Array32 => {
-            let len = rd.read_data_u32()?;
-            for _ in 0..len {
-                skip_value(rd)?;
-            }
-            Ok(())
-        }
-        Marker::FixMap(len) => {
-            for _ in 0..len {
-                skip_value(rd)?;
-                skip_value(rd)?;
-            }
-            Ok(())
-        }
-        Marker::Map16 => {
-            let len = rd.read_data_u16()?;
-            for _ in 0..len {
-                skip_value(rd)?;
-                skip_value(rd)?;
-            }
-            Ok(())
-        }
-        Marker::Map32 => {
-            let len = rd.read_data_u32()?;
-            for _ in 0..len {
-                skip_value(rd)?;
-                skip_value(rd)?;
-            }
-            Ok(())
-        }
-        Marker::FixExt1 => {
-            rd.read_data_i8()?;
-            skip_bytes(rd, 1)
-        }
-        Marker::FixExt2 => {
-            rd.read_data_i8()?;
-            skip_bytes(rd, 2)
-        }
-        Marker::FixExt4 => {
-            rd.read_data_i8()?;
-            skip_bytes(rd, 4)
-        }
-        Marker::FixExt8 => {
-            rd.read_data_i8()?;
-            skip_bytes(rd, 8)
-        }
-        Marker::FixExt16 => {
-            rd.read_data_i8()?;
-            skip_bytes(rd, 16)
-        }
-        Marker::Ext8 => {
-            let len = rd.read_data_u8()? as usize;
-            rd.read_data_i8()?;
-            skip_bytes(rd, len)
-        }
-        Marker::Ext16 => {
-            let len = rd.read_data_u16()? as usize;
-            rd.read_data_i8()?;
-            skip_bytes(rd, len)
-        }
-        Marker::Ext32 => {
-            let len = rd.read_data_u32()? as usize;
-            rd.read_data_i8()?;
-            skip_bytes(rd, len)
-        }
-        Marker::Reserved => Ok(()),
-    }
-}
-
-fn skip_bytes<R: RmpRead>(rd: &mut R, mut len: usize) -> Result<(), ValueReadError<R::Error>> {
-    let mut buf = [0u8; 256];
-    while len > 0 {
-        let chunk = len.min(buf.len());
-        rd.read_exact_buf(&mut buf[..chunk])
-            .map_err(ValueReadError::InvalidDataRead)?;
-        len -= chunk;
-    }
-    Ok(())
-}
 
 fn build_latency_writer(folder_prefix: &str, file_suffix: &str) -> Writer<std::fs::File> {
     let folder_path = format!("logs/{folder_prefix}");
