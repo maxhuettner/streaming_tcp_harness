@@ -1,12 +1,13 @@
 mod shared_vec_iter;
+mod binary_serde;
 
 use crate::shared_vec_iter::{SharedVec, SharedVecIterator};
+use crate::binary_serde::BinaryEncoder;
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use humantime::format_duration;
 use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use parquet::file::reader::SerializedFileReader;
-use rmp::encode::{write_array_len, write_nil, write_sint, write_str, write_uint};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader as StdBufReader};
@@ -89,7 +90,7 @@ struct Cli {
     schema: SchemaType,
 
     /// Framing used by the source when sending rows
-    #[arg(long, value_enum, default_value_t = Framing::None)]
+    #[arg(long, value_enum, default_value_t = Framing::LenPrefix)]
     framing: Framing,
 
     /// Enable periodic event-rate logging (writes events_*.csv). Off by default.
@@ -274,7 +275,7 @@ fn init_queue_from_reader(
     let rows = SharedVec::new(row_data);
     let end_reading = Instant::now();
     println!(
-        "Reading & MessagePack-encoding done (took: {})",
+        "Reading & binary encoding done (took: {})",
         format_duration(Duration::from_millis(
             end_reading.duration_since(begin_reading).as_millis() as u64
         ))
@@ -300,7 +301,7 @@ fn init_queue_from_csv(file_path: &str, num_events: Option<usize>) -> SharedVec<
     let rows = SharedVec::new(row_data);
     let end_reading = Instant::now();
     println!(
-        "Reading & MessagePack-encoding done (took: {})",
+        "Reading & binary encoding done (took: {})",
         format_duration(Duration::from_millis(
             end_reading.duration_since(begin_reading).as_millis() as u64
         ))
@@ -309,7 +310,6 @@ fn init_queue_from_csv(file_path: &str, num_events: Option<usize>) -> SharedVec<
 }
 
 fn encode_bid(json: &Value, system: &System, null_price: bool) -> Option<Vec<u8>> {
-    // Flat schema; tolerate nulls by defaulting
     let auction = json.get("auction").and_then(Value::as_i64).unwrap_or(0);
     let bidder = json.get("bidder").and_then(Value::as_i64).unwrap_or(0);
     let price = json.get("price").and_then(Value::as_i64).unwrap_or(0);
@@ -318,50 +318,47 @@ fn encode_bid(json: &Value, system: &System, null_price: bool) -> Option<Vec<u8>
     let ms_ts = parse_dt_millis(json.get("dateTime").and_then(Value::as_str));
     let extra = non_empty_str(json.get("extra").and_then(Value::as_str));
 
-    // Order per legacy spec (matches master and downstream parsers):
-    // [auction, bidder, price, channel, url, extra, dateTime_ms]
-    let mut buf = Vec::new();
+    // Schema: [auction, bidder, price, channel, url, dateTime, extra, latency_ts]
+    let mut encoder = match system {
+        System::Default => BinaryEncoder::with_capacity(8),
+        System::Nes => BinaryEncoder::with_capacity(4),
+    };
 
     match system {
         System::Default => {
-            write_array_len(&mut buf, 7).ok()?;
-            write_sint(&mut buf, auction).ok()?;
-            write_sint(&mut buf, bidder).ok()?;
-
+            encoder.add_int64(auction);
+            encoder.add_int64(bidder);
+            // Use null if null_price is true, otherwise use the actual price
             if null_price {
-                write_nil(&mut buf).ok()?;
+                encoder.add_null();
             } else {
-                write_sint(&mut buf, price).ok()?;
+                encoder.add_int64(price);
             }
-
-            write_str_safe(&mut buf, channel).ok()?;
-            write_str_safe(&mut buf, url).ok()?;
-            write_sint(&mut buf, ms_ts).ok()?;
-            write_str_safe(&mut buf, extra).ok()?;
+            encoder.add_string(channel.to_string());
+            encoder.add_string(url.to_string());
+            encoder.add_timestamp(ms_ts);
+            encoder.add_string(extra.to_string());
+            encoder.add_int64(0); // latency_ts placeholder
         }
         System::Nes => {
-            write_array_len(&mut buf, 4).ok()?;
-            write_sint(&mut buf, auction).ok()?;
-            write_sint(&mut buf, bidder).ok()?;
-
+            encoder.add_int64(auction);
+            encoder.add_int64(bidder);
             if null_price {
-                write_nil(&mut buf).ok()?;
+                encoder.add_null();
             } else {
-                write_sint(&mut buf, price).ok()?;
+                encoder.add_int64(price);
             }
-
-            write_sint(&mut buf, ms_ts).ok()?;
+            encoder.add_timestamp(ms_ts);
         }
     }
 
-    Some(buf)
+    Some(encoder.encode_payload())
 }
 
 fn encode_csv_line(line: &str) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    write_array_len(&mut buf, 1).ok()?;
-    write_str(&mut buf, line).ok()?;
-    Some(buf)
+    let mut encoder = BinaryEncoder::with_capacity(1);
+    encoder.add_string(line.to_string());
+    Some(encoder.encode_payload())
 }
 
 fn encode_auction(json: &Value, system: &System) -> Option<Vec<u8>> {
@@ -389,35 +386,36 @@ fn encode_auction(json: &Value, system: &System) -> Option<Vec<u8>> {
 
     // Order per spec (10 fields):
     // [id, itemName, description, initialBid, reserve, dateTime_ms, expires_ms, seller, category, extra]
-    let mut buf = Vec::new();
+    let mut encoder = match system {
+        System::Default => BinaryEncoder::with_capacity(10),
+        System::Nes => BinaryEncoder::with_capacity(7),
+    };
 
     match system {
         System::Default => {
-            write_array_len(&mut buf, 10).ok()?;
-            write_sint(&mut buf, id).ok()?;
-            write_str_safe(&mut buf, item_name).ok()?;
-            write_str_safe(&mut buf, description).ok()?;
-            write_sint(&mut buf, initial_bid).ok()?;
-            write_sint(&mut buf, reserve).ok()?;
-            write_sint(&mut buf, dt_ms).ok()?;
-            write_sint(&mut buf, expires_ms).ok()?;
-            write_sint(&mut buf, seller).ok()?;
-            write_sint(&mut buf, category).ok()?;
-            write_str_safe(&mut buf, extra).ok()?;
+            encoder.add_int64(id);
+            encoder.add_string(item_name.to_string());
+            encoder.add_string(description.to_string());
+            encoder.add_int64(initial_bid);
+            encoder.add_int64(reserve);
+            encoder.add_timestamp(dt_ms);
+            encoder.add_timestamp(expires_ms);
+            encoder.add_int64(seller);
+            encoder.add_int64(category);
+            encoder.add_string(extra.to_string());
         }
         System::Nes => {
-            write_array_len(&mut buf, 7).ok()?;
-            write_sint(&mut buf, id).ok()?;
-            write_sint(&mut buf, initial_bid).ok()?;
-            write_sint(&mut buf, reserve).ok()?;
-            write_sint(&mut buf, dt_ms).ok()?;
-            write_sint(&mut buf, expires_ms).ok()?;
-            write_sint(&mut buf, seller).ok()?;
-            write_sint(&mut buf, category).ok()?;
+            encoder.add_int64(id);
+            encoder.add_int64(initial_bid);
+            encoder.add_int64(reserve);
+            encoder.add_timestamp(dt_ms);
+            encoder.add_timestamp(expires_ms);
+            encoder.add_int64(seller);
+            encoder.add_int64(category);
         }
     }
 
-    Some(buf)
+    Some(encoder.encode_payload())
 }
 
 fn encode_person(json: &Value, system: &System) -> Option<Vec<u8>> {
@@ -444,30 +442,31 @@ fn encode_person(json: &Value, system: &System) -> Option<Vec<u8>> {
 
     // Order per spec (8 fields):
     // [id, name, emailAddress, creditCard, city, state, dateTime_ms, extra]
-    let mut buf = Vec::new();
+    let mut encoder = match system {
+        System::Default => BinaryEncoder::with_capacity(8),
+        System::Nes => BinaryEncoder::with_capacity(4),
+    };
 
     match system {
         System::Default => {
-            write_array_len(&mut buf, 8).ok()?;
-            write_sint(&mut buf, id).ok()?;
-            write_str_safe(&mut buf, name).ok()?;
-            write_str_safe(&mut buf, email).ok()?;
-            write_str_safe(&mut buf, credit_card).ok()?;
-            write_str_safe(&mut buf, city).ok()?;
-            write_str_safe(&mut buf, state).ok()?;
-            write_sint(&mut buf, dt_ms).ok()?;
-            write_str_safe(&mut buf, extra).ok()?;
+            encoder.add_int64(id);
+            encoder.add_string(name.to_string());
+            encoder.add_string(email.to_string());
+            encoder.add_string(credit_card.to_string());
+            encoder.add_string(city.to_string());
+            encoder.add_string(state.to_string());
+            encoder.add_timestamp(dt_ms);
+            encoder.add_string(extra.to_string());
         }
         System::Nes => {
-            write_array_len(&mut buf, 4).ok()?;
-            write_sint(&mut buf, id).ok()?;
-            write_str_safe(&mut buf, credit_card).ok()?;
-            write_sint(&mut buf, dt_ms).ok()?;
-            write_str_safe(&mut buf, extra).ok()?;
+            encoder.add_int64(id);
+            encoder.add_string(credit_card.to_string());
+            encoder.add_timestamp(dt_ms);
+            encoder.add_string(extra.to_string());
         }
     }
 
-    Some(buf)
+    Some(encoder.encode_payload())
 }
 
 fn parse_dt_millis(dt_opt: Option<&str>) -> i64 {
@@ -503,85 +502,20 @@ fn non_empty_str(s: Option<&str>) -> &str {
     }
 }
 
-#[inline]
-fn write_str_safe(buf: &mut Vec<u8>, s: &str) -> Result<(), rmp::encode::ValueWriteError> {
-    // Centralizes the policy of converting empty strings to a single space
-    // and writing via rmp encoder.
-    let v = if s.is_empty() { " " } else { s };
-    write_str(buf, v)
-}
-
-#[inline]
-fn write_fixed_str(
-    buf: &mut Vec<u8>,
-    s: &str,
-    byte_len: usize,
-) -> Result<(), rmp::encode::ValueWriteError> {
-    let fixed = fixed_str_bytes(s, byte_len);
-    write_str(buf, &fixed)
-}
-
-// Return a UTF-8 string exactly `byte_len` bytes long by truncating
-// on a char boundary and padding with spaces as needed.
-fn fixed_str_bytes(s: &str, byte_len: usize) -> String {
-    // Handle trivial case
-    if s.len() == byte_len {
-        return s.to_string();
-    }
-    // Truncate on UTF-8 boundary if longer than desired
-    let mut out = if s.len() > byte_len {
-        let mut cut = byte_len;
-        while cut > 0 && !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s[..cut].to_string()
-    } else {
-        s.to_string()
-    };
-    // Pad with ASCII spaces up to exact byte_len
-    let cur = out.len();
-    if cur < byte_len {
-        out.push_str(&" ".repeat(byte_len - cur));
-    }
-    out
-}
-
-fn parse_array_header(row: &[u8]) -> Option<(u32, usize)> {
-    let first = *row.first()?;
-    match first {
-        0x90..=0x9f => Some(((first & 0x0f) as u32, 1)),
-        0xdc => {
-            if row.len() < 3 {
-                return None;
-            }
-            let len = u16::from_be_bytes([row[1], row[2]]) as u32;
-            Some((len, 3))
-        }
-        0xdd => {
-            if row.len() < 5 {
-                return None;
-            }
-            let len = u32::from_be_bytes([row[1], row[2], row[3], row[4]]);
-            Some((len, 5))
-        }
-        _ => None,
-    }
-}
 
 fn with_latency_field(row: &[u8], ts_ns: u64) -> io::Result<Vec<u8>> {
-    let (len, header_len) = parse_array_header(row).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "row is not a msgpack array")
-    })?;
-    let new_len = len
-        .checked_add(1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "array length overflow"))?;
+    // Replace the last 8 bytes (latency_ts placeholder) with actual timestamp
+    if row.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "row too short",
+        ));
+    }
 
-    let mut out = Vec::with_capacity(row.len() + 10);
-    write_array_len(&mut out, new_len)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    out.extend_from_slice(&row[header_len..]);
-    write_uint(&mut out, ts_ns)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut out = row.to_vec();
+    let len = out.len();
+    out[len - 8..].copy_from_slice(&(ts_ns as i64).to_be_bytes());
+
     Ok(out)
 }
 
@@ -591,22 +525,28 @@ async fn write_frame(
     framing: Framing,
     latency: bool,
 ) -> io::Result<()> {
-    let row_with_latency = if latency {
+    if latency {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0));
-        Some(with_latency_field(row, now.as_nanos() as u64)?)
-    } else {
-        None
-    };
-    let row_bytes = row_with_latency.as_deref().unwrap_or(row);
+        let row_bytes = with_latency_field(row, now.as_nanos() as u64)?;
 
-    if matches!(framing, Framing::LenPrefix) {
-        writer
-            .write_all(&(row_bytes.len() as u32).to_le_bytes())
-            .await?;
+        if matches!(framing, Framing::LenPrefix) {
+            writer
+                .write_all(&(row_bytes.len() as i32).to_be_bytes())
+                .await?;
+        }
+        writer.write_all(&row_bytes).await?;
+    } else {
+        if matches!(framing, Framing::LenPrefix) {
+            writer
+                .write_all(&(row.len() as i32).to_be_bytes())
+                .await?;
+        }
+        writer.write_all(row).await?;
     }
-    writer.write_all(row_bytes).await
+
+    Ok(())
 }
 
 fn create_server_thread(
@@ -736,6 +676,8 @@ async fn handle_connection(
             logger.log_event();
         }
     }
+
+    writer.flush().await.unwrap();
 
     if num_connections.fetch_sub(1, Ordering::Relaxed) == 1 {
         repetition_id.fetch_add(1, Ordering::Relaxed);
