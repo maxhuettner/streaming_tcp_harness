@@ -677,7 +677,10 @@ async fn handle_connection(
         }
     }
 
-    writer.flush().await.unwrap();
+    match writer.flush().await {
+        Ok(_) => (),
+        Err(_) => eprintln!("Error flushing writer"),
+    }
 
     if num_connections.fetch_sub(1, Ordering::Relaxed) == 1 {
         repetition_id.fetch_add(1, Ordering::Relaxed);
