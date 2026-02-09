@@ -1,3 +1,4 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
 use csv::Writer;
 use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
@@ -183,6 +184,7 @@ async fn handle_connection(
     let mut len_buf = [0u8; 4];
     let mut payload = Vec::new();
     let mut stats = LatencyStats::default();
+    let mut latency_samples: Vec<(u64, u64)> = Vec::new();
     while reader.read_exact(&mut len_buf).await.is_ok() {
         let len = i32::from_be_bytes(len_buf) as usize;
         if latency {
@@ -195,12 +197,11 @@ async fn handle_connection(
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default();
-                    let now_ns = now.as_nanos();
-                    let latency_ns = now_ns.saturating_sub(send_ts_ns as u128) as u64;
+                    let now_ns = now.as_nanos() as u64;
+                    let latency_ns = now_ns.saturating_sub(send_ts_ns as u64);
                     stats.update(latency_ns);
-                    if let Some(writer) = &latency_writer {
-                        let mut w = writer.lock().await;
-                        let _ = w.write_record([latency_ns.to_string()]);
+                    if latency_writer.is_some() {
+                        latency_samples.push((latency_ns, now_ns));
                     }
                 }
             }
@@ -224,7 +225,14 @@ async fn handle_connection(
         );
     }
     if let Some(writer) = &latency_writer {
-        let _ = writer.lock().await.flush();
+        if !latency_samples.is_empty() {
+            let mut w = writer.lock().await;
+            for (latency_ns, recv_ns) in latency_samples {
+                let recv_ts = format_ns_rfc3339(recv_ns);
+                let _ = w.write_record([latency_ns.to_string(), recv_ts]);
+            }
+            let _ = w.flush();
+        }
     }
 
     if num_connections.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -293,6 +301,15 @@ fn build_latency_writer(folder_prefix: &str, file_suffix: &str) -> Writer<std::f
     fs::create_dir_all(&folder_path).unwrap();
     let mut writer =
         Writer::from_path(format!("{folder_path}/latency_{file_suffix}.csv")).unwrap();
-    writer.write_record(["latency_ns"]).unwrap();
+    writer.write_record(["latency_ns", "recv_ts"]).unwrap();
     writer
+}
+
+fn format_ns_rfc3339(ns: u64) -> String {
+    let secs = (ns / 1_000_000_000) as i64;
+    let nanos = (ns % 1_000_000_000) as u32;
+    match DateTime::<Utc>::from_timestamp(secs, nanos) {
+        Some(dt) => dt.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        None => String::new(),
+    }
 }
