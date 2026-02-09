@@ -6,3 +6,4 @@ event*.csv
 logs/**
 *.parquet
 data/**
+.claude
