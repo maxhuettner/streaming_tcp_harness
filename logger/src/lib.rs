@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{interval, Interval};
+use tokio::time::{interval, Interval, MissedTickBehavior};
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkLogger {
@@ -63,9 +63,11 @@ impl BenchmarkLoggerBuilder {
             Writer::from_path(format!("{folder_path}/events_{}.csv", self.file_suffix)).unwrap();
         let time_log_writer =
             Writer::from_path(format!("{folder_path}/time_{}.csv", self.file_suffix)).unwrap();
+        let mut log_interval = interval(self.log_interval);
+        log_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         BenchmarkLogger {
-            log_interval: Arc::new(Mutex::new(interval(self.log_interval))),
+            log_interval: Arc::new(Mutex::new(log_interval)),
             is_stop: Arc::new(AtomicBool::new(false)),
             num_events: Arc::new(EventCounter::new()),
             log_thread: Arc::new(Mutex::new(None)),
@@ -95,6 +97,8 @@ impl BenchmarkLogger {
         *self.log_thread.lock().await = Some(tokio::spawn(async move {
             // Create a logger instance and get its interval
             start_signal.notified().await;
+            // Start measuring from first observed event, not logger creation time.
+            log_interval.lock().await.reset();
             loop {
                 if is_stop.load(Ordering::Relaxed) {
                     break;

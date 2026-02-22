@@ -5,6 +5,7 @@ use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio::{io, task};
 
 const LOG_FOLDER_PREFIX: &str = "sink";
+const SHUTDOWN_POLL_INTERVAL_MS: u64 = 200;
 
 fn delete_previous_logs(folder_prefix: &str, exp_name: &str) {
     use std::fs;
@@ -35,7 +37,7 @@ struct Cli {
 
     /// Enable periodic event-rate logging (writes events_*.csv). Off by default.
     #[arg(long, default_value_t = false)]
-    event_logging: bool,
+    disable_event_logging: bool,
 
     /// Parse the last value from MessagePack array as send_ts_ns and compute receive latency.
     #[arg(long, default_value_t = false)]
@@ -46,7 +48,7 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    start_benchmark(cli.address, cli.exp_name, cli.event_logging, cli.latency).await;
+    start_benchmark(cli.address, cli.exp_name, !cli.disable_event_logging, cli.latency).await;
 }
 
 async fn start_benchmark(address: String, exp_name: String, event_logging: bool, latency: bool) {
@@ -155,12 +157,14 @@ fn create_server_thread(
             let repetition_id = repetition_id.clone();
             let num_connections = num_connections.clone();
             let latency_writer = latency_writer.clone();
+            let done = done.clone();
             threads.lock().await.push(task::spawn(async move {
                 handle_connection(
                     reader,
                     logger,
                     num_connections,
                     repetition_id,
+                    done,
                     latency,
                     latency_writer,
                 )
@@ -175,6 +179,7 @@ async fn handle_connection(
     mut logger: BenchmarkLogger,
     num_connections: Arc<AtomicUsize>,
     repetition_id: Arc<AtomicUsize>,
+    done: Arc<AtomicBool>,
     latency: bool,
     latency_writer: Option<Arc<Mutex<Writer<std::fs::File>>>>,
 ) {
@@ -185,13 +190,18 @@ async fn handle_connection(
     let mut payload = Vec::new();
     let mut stats = LatencyStats::default();
     let mut latency_samples: Vec<(u64, u64)> = Vec::new();
-    while reader.read_exact(&mut len_buf).await.is_ok() {
+    while read_exact_or_shutdown(&mut reader, &mut len_buf, &done)
+        .await
+        .unwrap_or(false)
+    {
         let len = i32::from_be_bytes(len_buf) as usize;
+        payload.resize(len, 0);
+        match read_exact_or_shutdown(&mut reader, &mut payload, &done).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => break,
+        }
+
         if latency {
-            payload.resize(len, 0);
-            if reader.read_exact(&mut payload).await.is_err() {
-                break;
-            }
             if let Ok(Some(send_ts_ns)) = extract_send_ts_ns(&payload) {
                 if send_ts_ns >= 0 {
                     let now = SystemTime::now()
@@ -204,11 +214,6 @@ async fn handle_connection(
                         latency_samples.push((latency_ns, now_ns));
                     }
                 }
-            }
-        } else {
-            let mut limited = (&mut reader).take(len as u64);
-            if io::copy(&mut limited, &mut io::sink()).await.is_err() {
-                break;
             }
         }
 
@@ -239,6 +244,29 @@ async fn handle_connection(
         repetition_id.fetch_add(1, Ordering::Relaxed);
         println!("All connections closed, stopping logger");
         logger.stop().await;
+    }
+}
+
+async fn read_exact_or_shutdown(
+    reader: &mut BufReader<TcpStream>,
+    buf: &mut [u8],
+    done: &AtomicBool,
+) -> io::Result<bool> {
+    loop {
+        if done.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+
+        match tokio::time::timeout(
+            Duration::from_millis(SHUTDOWN_POLL_INTERVAL_MS),
+            reader.read_exact(buf),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(true),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => continue,
+        }
     }
 }
 
