@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 use tokio::{io, task};
 
 const LOG_FOLDER_PREFIX: &str = "source";
+const SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 2;
 
 fn delete_previous_logs(folder_prefix: &str, exp_name: &str) {
     use std::fs;
@@ -64,7 +65,7 @@ enum InputFormat {
 struct Cli {
     file_path: String,
 
-    #[arg(long, short, default_value = "0.0.0.0:9000")]
+    #[arg(long, short, default_value = "0.0.0.0:10000")]
     address: String,
 
     #[arg(long, short, default_value = "test")]
@@ -86,7 +87,7 @@ struct Cli {
     num_events: Option<usize>,
 
     /// Selects which schema to use for decoding (parquet input only)
-    #[arg(long, value_enum, default_value_t = SchemaType::Bid)]
+    #[arg(long, value_enum)]
     schema: SchemaType,
 
     /// Framing used by the source when sending rows
@@ -95,7 +96,7 @@ struct Cli {
 
     /// Enable periodic event-rate logging (writes events_*.csv). Off by default.
     #[arg(long, default_value_t = false)]
-    event_logging: bool,
+    disable_event_logging: bool,
 
     /// Append a high-resolution send timestamp (ns since Unix epoch) as an extra array field.
     #[arg(long, default_value_t = false)]
@@ -158,7 +159,7 @@ async fn main() {
         cli.schema,
         cli.rate,
         cli.num_events,
-        cli.event_logging,
+        !cli.disable_event_logging,
         cli.framing,
         cli.latency,
         cli.null_price_percent,
@@ -604,6 +605,7 @@ fn create_server_thread(
             let repetition_id = repetition_id.clone();
             let num_connections = num_connections.clone();
             let row_iter = row_iter.clone();
+            let done = done.clone();
             threads.lock().await.push(task::spawn(async move {
                 handle_connection(
                     writer,
@@ -611,6 +613,7 @@ fn create_server_thread(
                     logger,
                     num_connections,
                     repetition_id,
+                    done,
                     rate,
                     framing,
                     latency,
@@ -627,6 +630,7 @@ async fn handle_connection(
     mut logger: BenchmarkLogger,
     num_connections: Arc<AtomicUsize>,
     repetition_id: Arc<AtomicUsize>,
+    done: Arc<AtomicBool>,
     rate: Option<usize>,
     framing: Framing,
     latency: bool,
@@ -647,10 +651,19 @@ async fn handle_connection(
         let async_tfd = AsyncFd::new(tfd).expect("asyncfd wrap failed");
 
         'outer: loop {
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
             let expirations = wait_expirations(&async_tfd).await;
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
 
             let mut sent = 0usize;
             for row in row_iter.by_ref().take(expirations as usize) {
+                if done.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
                 if write_frame(&mut writer, &row, framing, latency)
                     .await
                     .is_err()
@@ -667,6 +680,9 @@ async fn handle_connection(
         }
     } else {
         for row in row_iter {
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
             if write_frame(&mut writer, &row, framing, latency)
                 .await
                 .is_err()
@@ -677,9 +693,25 @@ async fn handle_connection(
         }
     }
 
-    match writer.flush().await {
-        Ok(_) => (),
-        Err(_) => eprintln!("Error flushing writer"),
+    let flush_result = if done.load(Ordering::Relaxed) {
+        match tokio::time::timeout(
+            Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS),
+            writer.flush(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "flush timed out during shutdown",
+            )),
+        }
+    } else {
+        writer.flush().await
+    };
+
+    if let Err(e) = flush_result {
+        eprintln!("Error flushing writer: {e}");
     }
 
     if num_connections.fetch_sub(1, Ordering::Relaxed) == 1 {
