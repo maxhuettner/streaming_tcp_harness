@@ -42,16 +42,33 @@ struct Cli {
     /// Parse the last value from MessagePack array as send_ts_ns and compute receive latency.
     #[arg(long, default_value_t = false)]
     latency: bool,
+
+    /// Initial repetition index used for repetition-related naming (e.g., logs ending in `_5`).
+    #[arg(long, default_value_t = 0)]
+    start_with_rep: usize,
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    start_benchmark(cli.address, cli.exp_name, !cli.disable_event_logging, cli.latency).await;
+    start_benchmark(
+        cli.address,
+        cli.exp_name,
+        !cli.disable_event_logging,
+        cli.latency,
+        cli.start_with_rep,
+    )
+    .await;
 }
 
-async fn start_benchmark(address: String, exp_name: String, event_logging: bool, latency: bool) {
+async fn start_benchmark(
+    address: String,
+    exp_name: String,
+    event_logging: bool,
+    latency: bool,
+    start_with_rep: usize,
+) {
     let listener = TcpListener::bind(&address).await.unwrap();
 
     let connection_threads = Arc::new(Mutex::new(Vec::new()));
@@ -67,6 +84,7 @@ async fn start_benchmark(address: String, exp_name: String, event_logging: bool,
         exp_name.clone(),
         event_logging,
         latency,
+        start_with_rep,
     );
 
     println!("Waiting for q");
@@ -102,9 +120,10 @@ fn create_server_thread(
     exp_name: String,
     event_logging: bool,
     latency: bool,
+    start_with_rep: usize,
 ) -> task::JoinHandle<()> {
     task::spawn(async move {
-        let repetition_id = Arc::new(AtomicUsize::new(0));
+        let repetition_id = Arc::new(AtomicUsize::new(start_with_rep));
         let num_connections = Arc::new(AtomicUsize::new(0));
         let folder_prefix = format!("{LOG_FOLDER_PREFIX}/{exp_name}");
 
@@ -130,7 +149,7 @@ fn create_server_thread(
 
             println!("Accepted connection");
 
-            if (repetition_id.load(Ordering::Relaxed) > 0)
+            if (repetition_id.load(Ordering::Relaxed) > start_with_rep)
                 && (num_connections.load(Ordering::Relaxed) == 0)
             {
                 println!("New repetition, starting logger");

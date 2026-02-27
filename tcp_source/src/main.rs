@@ -105,6 +105,10 @@ struct Cli {
     /// Percentage (0-100) of Bid `price` values to encode as null (MessagePack nil).
     #[arg(long)]
     null_price_percent: Option<u8>,
+
+    /// Initial repetition index used for repetition-related naming (e.g., logs ending in `_5`).
+    #[arg(long, default_value_t = 0)]
+    start_with_rep: usize,
 }
 
 /* -------------------- Simple PRNG + helper -------------------- */
@@ -163,6 +167,7 @@ async fn main() {
         cli.framing,
         cli.latency,
         cli.null_price_percent,
+        cli.start_with_rep,
     )
     .await;
 }
@@ -180,6 +185,7 @@ async fn start_benchmark(
     framing: Framing,
     latency: bool,
     null_price_percent: Option<u8>,
+    start_with_rep: usize,
 ) {
     // Clean up previous logs for this experiment name on startup
     delete_previous_logs(LOG_FOLDER_PREFIX, &exp_name);
@@ -211,6 +217,7 @@ async fn start_benchmark(
         event_logging,
         framing,
         latency,
+        start_with_rep,
     );
 
     println!("Waiting for q...");
@@ -561,9 +568,10 @@ fn create_server_thread(
     event_logging: bool,
     framing: Framing,
     latency: bool,
+    start_with_rep: usize,
 ) -> task::JoinHandle<()> {
     task::spawn(async move {
-        let repetition_id = Arc::new(AtomicUsize::new(0));
+        let repetition_id = Arc::new(AtomicUsize::new(start_with_rep));
         let num_connections = Arc::new(AtomicUsize::new(0));
         let mut row_iter = rows.iter();
 
@@ -583,7 +591,7 @@ fn create_server_thread(
 
             println!("Accepted connection");
 
-            if (repetition_id.load(Ordering::Relaxed) > 0)
+            if (repetition_id.load(Ordering::Relaxed) > start_with_rep)
                 && (num_connections.load(Ordering::Relaxed) == 0)
             {
                 println!("Repetition {}, starting logger", repetition_id.load(Ordering::Relaxed));
