@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{interval, Interval};
+use tokio::time::{interval, Interval, MissedTickBehavior};
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkLogger {
@@ -63,9 +63,11 @@ impl BenchmarkLoggerBuilder {
             Writer::from_path(format!("{folder_path}/events_{}.csv", self.file_suffix)).unwrap();
         let time_log_writer =
             Writer::from_path(format!("{folder_path}/time_{}.csv", self.file_suffix)).unwrap();
+        let mut log_interval = interval(self.log_interval);
+        log_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         BenchmarkLogger {
-            log_interval: Arc::new(Mutex::new(interval(self.log_interval))),
+            log_interval: Arc::new(Mutex::new(log_interval)),
             is_stop: Arc::new(AtomicBool::new(false)),
             num_events: Arc::new(EventCounter::new()),
             log_thread: Arc::new(Mutex::new(None)),
@@ -83,6 +85,8 @@ impl BenchmarkLogger {
             return;
         }
 
+        self.num_events.set_start_ts();
+
         let requested_rate = self.requested_rate;
         let log_writer = self.event_log_writer.clone();
         let num_events = self.num_events.clone();
@@ -92,6 +96,8 @@ impl BenchmarkLogger {
 
         *self.log_thread.lock().await = Some(tokio::spawn(async move {
             start_signal.notified().await;
+            // Start measuring from first observed event, not logger creation time.
+            log_interval.lock().await.reset();
             loop {
                 if is_stop.load(Ordering::Relaxed) {
                     break;
@@ -120,6 +126,8 @@ impl BenchmarkLogger {
     }
 
     pub async fn stop(&mut self) {
+        self.num_events.set_end_ts();
+
         if let Some(log_thread) = self.log_thread.lock().await.take() {
             self.is_stop.store(true, Ordering::Relaxed);
             log_thread.await.unwrap();
@@ -140,23 +148,35 @@ impl BenchmarkLogger {
     async fn write_times(&mut self) {
         let mut writer = self.time_log_writer.lock().await;
 
+        let start_ts = self.num_events.get_start_ts();
+        let end_ts = self.num_events.get_end_ts();
         let first_elem_ts = self.num_events.get_first_elem_ts();
         let last_elem_ts = self.num_events.get_last_elem_ts();
         let duration_us = last_elem_ts - first_elem_ts;
         let num_events = self.num_events.get_total();
-        let tps = ((num_events as f64) / (duration_us as f64) * 1_000_000.0) as usize;
+        let tps = if num_events == 0 || duration_us <= 0 {
+            0
+        } else {
+            ((num_events as f64) / (duration_us as f64) * 1_000_000.0) as usize
+        };
 
         writer
             .serialize(TimeRow {
-                start_time: DateTime::from_timestamp_micros(first_elem_ts)
+                start_time: DateTime::from_timestamp_micros(start_ts)
                     .unwrap()
                     .to_rfc3339(),
-                end_time: DateTime::from_timestamp_micros(last_elem_ts)
+                end_time: DateTime::from_timestamp_micros(end_ts)
+                    .unwrap()
+                    .to_rfc3339(),
+                first_elem_time: DateTime::from_timestamp_micros(first_elem_ts)
+                    .unwrap()
+                    .to_rfc3339(),
+                last_elem_time: DateTime::from_timestamp_micros(last_elem_ts)
                     .unwrap()
                     .to_rfc3339(),
                 duration_us,
                 num_events,
-                tps
+                tps,
             })
             .unwrap()
     }
