@@ -12,9 +12,9 @@ humantime = "2.1.0"
 crossbeam-queue = "0.3.11"
 logger = { path = "../logger" }
 serde_cbor = "0.11.2"
-prost = "0.14.1"
-prost-types = "0.14.1"
+serde_json = "1.0"
 rmp = {workspace = true}
+timerfd = "1.6"
 
 [build-dependencies]
 prost-build = "0.14.1"

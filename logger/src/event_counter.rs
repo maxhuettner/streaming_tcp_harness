@@ -7,6 +7,8 @@ pub struct EventCounter {
     current: AtomicUsize,
     total: AtomicUsize,
 
+    start_ts: Arc<AtomicI64>,
+    end_ts: Arc<AtomicI64>,
     first_elem_ts: Arc<AtomicI64>,
     last_elem_ts: Arc<AtomicI64>,
 }
@@ -16,9 +18,29 @@ impl EventCounter {
         Self {
             current: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
+            start_ts: Arc::new(AtomicI64::new(0)),
+            end_ts: Arc::new(AtomicI64::new(0)),
             first_elem_ts: Arc::new(AtomicI64::new(0)),
             last_elem_ts: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    pub fn set_start_ts(&self) {
+        let current_ts = Utc::now().timestamp_micros();
+        self.start_ts.store(current_ts, Ordering::Relaxed);
+    }
+
+    pub fn get_start_ts(&self) -> i64 {
+        self.start_ts.load(Ordering::Relaxed)
+    }
+
+    pub fn set_end_ts(&self) {
+        let current_ts = Utc::now().timestamp_micros();
+        self.end_ts.store(current_ts, Ordering::Relaxed);
+    }
+
+    pub fn get_end_ts(&self) -> i64 {
+        self.end_ts.load(Ordering::Relaxed)
     }
 
     pub fn increment(&self, num_events: usize) {
