@@ -1,8 +1,8 @@
-mod shared_vec_iter;
 mod binary_serde;
+mod shared_vec_iter;
 
-use crate::shared_vec_iter::{SharedVec, SharedVecIterator};
 use crate::binary_serde::BinaryEncoder;
+use crate::shared_vec_iter::{SharedVec, SharedVecIterator};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use humantime::format_duration;
@@ -10,11 +10,11 @@ use logger::{BenchmarkLogger, BenchmarkLoggerBuilder};
 use parquet::file::reader::SerializedFileReader;
 use serde_json::Value;
 use std::fs::File;
+use std::hint::spin_loop;
 use std::io::{BufRead, BufReader as StdBufReader};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -194,9 +194,16 @@ async fn start_benchmark(
         InputFormat::Parquet => {
             let file = File::open(&file_path).unwrap();
             let reader = SerializedFileReader::new(file).unwrap();
-            init_queue_from_reader(reader, schema, system, num_events, null_price_percent)
+            init_queue_from_reader(
+                reader,
+                schema,
+                system,
+                latency,
+                num_events,
+                null_price_percent,
+            )
         }
-        InputFormat::Csv => init_queue_from_csv(&file_path, num_events),
+        InputFormat::Csv => init_queue_from_csv(&file_path, latency, num_events),
     })
     .await
     .unwrap();
@@ -250,6 +257,7 @@ fn init_queue_from_reader(
     reader: SerializedFileReader<File>,
     schema: SchemaType,
     system: System,
+    latency: bool,
     num_events: Option<usize>,
     null_price_percent: Option<u8>,
 ) -> SharedVec<Vec<u8>> {
@@ -268,10 +276,10 @@ fn init_queue_from_reader(
         match schema {
             SchemaType::Bid => {
                 let null_price = should_null_price(null_price_percent, &mut rng);
-                encode_bid(&json, &system, null_price)
+                encode_bid(&json, &system, null_price, latency)
             }
-            SchemaType::Auction => encode_auction(&json, &system),
-            SchemaType::Person => encode_person(&json, &system),
+            SchemaType::Auction => encode_auction(&json, &system, latency),
+            SchemaType::Person => encode_person(&json, &system, latency),
         }
     });
 
@@ -291,13 +299,17 @@ fn init_queue_from_reader(
     rows
 }
 
-fn init_queue_from_csv(file_path: &str, num_events: Option<usize>) -> SharedVec<Vec<u8>> {
+fn init_queue_from_csv(
+    file_path: &str,
+    latency: bool,
+    num_events: Option<usize>,
+) -> SharedVec<Vec<u8>> {
     let begin_reading = Instant::now();
     let file = File::open(file_path).unwrap();
     let reader = StdBufReader::new(file);
 
     let lines = reader.lines().filter_map(|line| match line {
-        Ok(content) => encode_csv_line(&content),
+        Ok(content) => encode_csv_line(&content, latency),
         Err(_) => None,
     });
 
@@ -317,7 +329,7 @@ fn init_queue_from_csv(file_path: &str, num_events: Option<usize>) -> SharedVec<
     rows
 }
 
-fn encode_bid(json: &Value, system: &System, null_price: bool) -> Option<Vec<u8>> {
+fn encode_bid(json: &Value, system: &System, null_price: bool, latency: bool) -> Option<Vec<u8>> {
     let auction = json.get("auction").and_then(Value::as_i64).unwrap_or(0);
     let bidder = json.get("bidder").and_then(Value::as_i64).unwrap_or(0);
     let price = json.get("price").and_then(Value::as_i64).unwrap_or(0);
@@ -326,10 +338,10 @@ fn encode_bid(json: &Value, system: &System, null_price: bool) -> Option<Vec<u8>
     let ms_ts = parse_dt_millis(json.get("dateTime").and_then(Value::as_str));
     let extra = non_empty_str(json.get("extra").and_then(Value::as_str));
 
-    // Schema: [auction, bidder, price, channel, url, dateTime, extra, latency_ts]
+    // Schema with latency: [auction, bidder, price, channel, url, dateTime, extra, latency_ts]
     let mut encoder = match system {
-        System::Default => BinaryEncoder::with_capacity(8),
-        System::Nes => BinaryEncoder::with_capacity(4),
+        System::Default => BinaryEncoder::with_capacity(7 + usize::from(latency)),
+        System::Nes => BinaryEncoder::with_capacity(4 + usize::from(latency)),
     };
 
     match system {
@@ -346,7 +358,9 @@ fn encode_bid(json: &Value, system: &System, null_price: bool) -> Option<Vec<u8>
             encoder.add_string(url.to_string());
             encoder.add_timestamp(ms_ts);
             encoder.add_string(extra.to_string());
-            encoder.add_int64(0); // latency_ts placeholder
+            if latency {
+                encoder.add_int64(0); // latency_ts placeholder
+            }
         }
         System::Nes => {
             encoder.add_int64(auction);
@@ -357,19 +371,25 @@ fn encode_bid(json: &Value, system: &System, null_price: bool) -> Option<Vec<u8>
                 encoder.add_int64(price);
             }
             encoder.add_timestamp(ms_ts);
+            if latency {
+                encoder.add_int64(0); // latency_ts placeholder
+            }
         }
     }
 
     Some(encoder.encode_payload())
 }
 
-fn encode_csv_line(line: &str) -> Option<Vec<u8>> {
-    let mut encoder = BinaryEncoder::with_capacity(1);
+fn encode_csv_line(line: &str, latency: bool) -> Option<Vec<u8>> {
+    let mut encoder = BinaryEncoder::with_capacity(1 + usize::from(latency));
     encoder.add_string(line.to_string());
+    if latency {
+        encoder.add_int64(0); // latency_ts placeholder
+    }
     Some(encoder.encode_payload())
 }
 
-fn encode_auction(json: &Value, system: &System) -> Option<Vec<u8>> {
+fn encode_auction(json: &Value, system: &System, latency: bool) -> Option<Vec<u8>> {
     // Nested under key `auction` in our data files
     let a: Option<&Value> = json.get("auction");
     if a.is_none() || a.unwrap().is_null() {
@@ -392,11 +412,11 @@ fn encode_auction(json: &Value, system: &System) -> Option<Vec<u8>> {
     let category = a.get("category").and_then(Value::as_i64).unwrap_or(0);
     let extra = non_empty_str(a.get("extra").and_then(Value::as_str));
 
-    // Order per spec (10 fields):
-    // [id, itemName, description, initialBid, reserve, dateTime_ms, expires_ms, seller, category, extra]
+    // Order per spec:
+    // [id, itemName, description, initialBid, reserve, dateTime_ms, expires_ms, seller, category, extra, latency_ts?]
     let mut encoder = match system {
-        System::Default => BinaryEncoder::with_capacity(10),
-        System::Nes => BinaryEncoder::with_capacity(7),
+        System::Default => BinaryEncoder::with_capacity(10 + usize::from(latency)),
+        System::Nes => BinaryEncoder::with_capacity(7 + usize::from(latency)),
     };
 
     match system {
@@ -411,6 +431,9 @@ fn encode_auction(json: &Value, system: &System) -> Option<Vec<u8>> {
             encoder.add_int64(seller);
             encoder.add_int64(category);
             encoder.add_string(extra.to_string());
+            if latency {
+                encoder.add_int64(0); // latency_ts placeholder
+            }
         }
         System::Nes => {
             encoder.add_int64(id);
@@ -420,13 +443,16 @@ fn encode_auction(json: &Value, system: &System) -> Option<Vec<u8>> {
             encoder.add_timestamp(expires_ms);
             encoder.add_int64(seller);
             encoder.add_int64(category);
+            if latency {
+                encoder.add_int64(0); // latency_ts placeholder
+            }
         }
     }
 
     Some(encoder.encode_payload())
 }
 
-fn encode_person(json: &Value, system: &System) -> Option<Vec<u8>> {
+fn encode_person(json: &Value, system: &System, latency: bool) -> Option<Vec<u8>> {
     // Nested under key `person` in our data files
     let p = json.get("person");
     if p.is_none() || p.unwrap().is_null() {
@@ -448,11 +474,11 @@ fn encode_person(json: &Value, system: &System) -> Option<Vec<u8>> {
     );
     let extra = non_empty_str(p.get("extra").and_then(Value::as_str));
 
-    // Order per spec (8 fields):
-    // [id, name, emailAddress, creditCard, city, state, dateTime_ms, extra]
+    // Order per spec:
+    // [id, name, emailAddress, creditCard, city, state, dateTime_ms, extra, latency_ts?]
     let mut encoder = match system {
-        System::Default => BinaryEncoder::with_capacity(8),
-        System::Nes => BinaryEncoder::with_capacity(4),
+        System::Default => BinaryEncoder::with_capacity(8 + usize::from(latency)),
+        System::Nes => BinaryEncoder::with_capacity(4 + usize::from(latency)),
     };
 
     match system {
@@ -465,12 +491,18 @@ fn encode_person(json: &Value, system: &System) -> Option<Vec<u8>> {
             encoder.add_string(state.to_string());
             encoder.add_timestamp(dt_ms);
             encoder.add_string(extra.to_string());
+            if latency {
+                encoder.add_int64(0); // latency_ts placeholder
+            }
         }
         System::Nes => {
             encoder.add_int64(id);
             encoder.add_string(credit_card.to_string());
             encoder.add_timestamp(dt_ms);
             encoder.add_string(extra.to_string());
+            if latency {
+                encoder.add_int64(0); // latency_ts placeholder
+            }
         }
     }
 
@@ -510,14 +542,10 @@ fn non_empty_str(s: Option<&str>) -> &str {
     }
 }
 
-
 fn with_latency_field(row: &[u8], ts_ns: u64) -> io::Result<Vec<u8>> {
     // Replace the last 8 bytes (latency_ts placeholder) with actual timestamp
     if row.len() < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "row too short",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "row too short"));
     }
 
     let mut out = row.to_vec();
@@ -547,9 +575,7 @@ async fn write_frame(
         writer.write_all(&row_bytes).await?;
     } else {
         if matches!(framing, Framing::LenPrefix) {
-            writer
-                .write_all(&(row.len() as i32).to_be_bytes())
-                .await?;
+            writer.write_all(&(row.len() as i32).to_be_bytes()).await?;
         }
         writer.write_all(row).await?;
     }
@@ -594,7 +620,10 @@ fn create_server_thread(
             if (repetition_id.load(Ordering::Relaxed) > start_with_rep)
                 && (num_connections.load(Ordering::Relaxed) == 0)
             {
-                println!("Repetition {}, starting logger", repetition_id.load(Ordering::Relaxed));
+                println!(
+                    "Repetition {}, starting logger",
+                    repetition_id.load(Ordering::Relaxed)
+                );
                 logger = BenchmarkLoggerBuilder::new(
                     format!("{}/{}", LOG_FOLDER_PREFIX, exp_name),
                     format!("{exp_name}_{}", repetition_id.load(Ordering::Relaxed)),
@@ -646,46 +675,16 @@ async fn handle_connection(
     num_connections.fetch_add(1, Ordering::Relaxed);
 
     if let Some(rate) = rate.filter(|r| *r > 0) {
-        let period = std::time::Duration::from_nanos(1_000_000_000u64 / rate as u64);
-        let mut tfd =
-            TimerFd::new_custom(ClockId::Monotonic, true, true).expect("timerfd create failed");
-        tfd.set_state(
-            TimerState::Periodic {
-                current: period,
-                interval: period,
-            },
-            SetTimeFlags::Default,
-        );
-        let async_tfd = AsyncFd::new(tfd).expect("asyncfd wrap failed");
-
-        'outer: loop {
-            if done.load(Ordering::Relaxed) {
-                break;
-            }
-            let expirations = wait_expirations(&async_tfd).await;
-            if done.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let mut sent = 0usize;
-            for row in row_iter.by_ref().take(expirations as usize) {
-                if done.load(Ordering::Relaxed) {
-                    break 'outer;
-                }
-                if write_frame(&mut writer, &row, framing, latency)
-                    .await
-                    .is_err()
-                {
-                    break 'outer;
-                }
-                logger.log_event();
-                sent += 1;
-            }
-
-            if sent < expirations as usize {
-                break;
-            }
-        }
+        send_with_rate(
+            &mut writer,
+            &mut row_iter,
+            &logger,
+            done.clone(),
+            rate,
+            framing,
+            latency,
+        )
+        .await;
     } else {
         for row in row_iter {
             if done.load(Ordering::Relaxed) {
@@ -729,18 +728,94 @@ async fn handle_connection(
     }
 }
 
-// Read the number of timer expirations from an AsyncFd-wrapped timerfd,
-// handling spurious readiness (0 expirations) by clearing readiness and
-// awaiting again.
-async fn wait_expirations(tfd: &AsyncFd<TimerFd>) -> u64 {
-    loop {
-        let mut guard = tfd.readable().await.expect("timerfd not readable");
-        let n = guard.get_ref().get_ref().read();
-        if n == 0 {
-            // Spurious readiness; clear and wait again
-            guard.clear_ready();
-            continue;
+async fn send_with_rate(
+    writer: &mut BufWriter<TcpStream>,
+    row_iter: &mut SharedVecIterator<Vec<u8>>,
+    logger: &BenchmarkLogger,
+    done: Arc<AtomicBool>,
+    rate: usize,
+    framing: Framing,
+    latency: bool,
+) {
+    let period = Duration::from_secs_f64(1.0 / rate as f64);
+    let mut next_deadline = Instant::now();
+
+    for row in row_iter {
+        if done.load(Ordering::Relaxed) {
+            break;
         }
-        return n;
+
+        next_deadline += period;
+
+        while Instant::now() < next_deadline {
+            spin_loop();
+        }
+
+        if write_frame(writer, &row, framing, latency).await.is_err() {
+            break;
+        }
+
+        logger.log_event();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn trailing_i64(bytes: &[u8]) -> i64 {
+        let len = bytes.len();
+        i64::from_be_bytes(bytes[len - 8..len].try_into().unwrap())
+    }
+
+    #[test]
+    fn auction_latency_field_is_appended_only_when_enabled() {
+        let json = json!({
+            "auction": {
+                "id": 7,
+                "itemName": "item",
+                "description": "desc",
+                "initialBid": 11,
+                "reserve": 12,
+                "dateTime": "2025-01-01T00:00:00Z",
+                "expires": "2025-01-01T01:00:00Z",
+                "seller": 13,
+                "category": 14,
+                "extra": "extra"
+            }
+        });
+
+        let without_latency = encode_auction(&json, &System::Default, false).unwrap();
+        let with_latency = encode_auction(&json, &System::Default, true).unwrap();
+        let rewritten = with_latency_field(&with_latency, 123).unwrap();
+
+        assert_eq!(with_latency.len(), without_latency.len() + 8);
+        assert_eq!(trailing_i64(&with_latency), 0);
+        assert_eq!(trailing_i64(&rewritten), 123);
+    }
+
+    #[test]
+    fn person_latency_field_is_appended_only_when_enabled() {
+        let json = json!({
+            "person": {
+                "id": 21,
+                "name": "name",
+                "emailAddress": "user@example.com",
+                "creditCard": "4111111111111111",
+                "city": "Berlin",
+                "state": "BE",
+                "dateTime": "2025-01-01T00:00:00Z",
+                "extra": "extra"
+            }
+        });
+
+        let without_latency = encode_person(&json, &System::Default, false).unwrap();
+        let with_latency = encode_person(&json, &System::Default, true).unwrap();
+        let rewritten = with_latency_field(&with_latency, 456).unwrap();
+
+        assert_eq!(with_latency.len(), without_latency.len() + 9);
+        assert_eq!(trailing_i64(&with_latency), 0);
+        assert_eq!(trailing_i64(&rewritten), 456);
     }
 }
