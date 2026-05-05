@@ -105,8 +105,8 @@ mod tests {
 
         // First int64 should be 1000
         let val = i64::from_be_bytes([
-            encoded[0], encoded[1], encoded[2], encoded[3],
-            encoded[4], encoded[5], encoded[6], encoded[7],
+            encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
+            encoded[7],
         ]);
         assert_eq!(val, 1000);
     }
